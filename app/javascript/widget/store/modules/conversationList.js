@@ -69,8 +69,22 @@ export const actions = {
     if (conversation) await dispatch('open', conversation.id);
   },
 
-  open: async ({ state: listState, commit, dispatch, rootState }, id) => {
-    if (rootState.conversationAttributes.id === id) return;
+  // Reopening the conversation on screen retries its first page when that load failed, offline
+  // for instance; otherwise it would stay empty until a socket reconnect happened to catch up.
+  open: async (
+    { state: listState, commit, dispatch, rootState, rootGetters },
+    id
+  ) => {
+    if (rootState.conversationAttributes.id === id) {
+      if (rootGetters['conversation/getHasLoadFailed']) {
+        await dispatch(
+          'conversation/fetchOldConversations',
+          {},
+          { root: true }
+        );
+      }
+      return;
+    }
     commit('switchThread');
     const { thread } = listState;
     dispatch('conversation/clearConversations', {}, { root: true });

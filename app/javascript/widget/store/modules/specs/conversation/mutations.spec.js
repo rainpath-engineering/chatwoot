@@ -178,6 +178,7 @@ describe('#mutations', () => {
           isAgentTyping: true,
           isCreating: true,
           isAwaitingCampaign: true,
+          hasLoadFailed: true,
         },
         pendingCustomAttributes: { plan: 'enterprise' },
         pendingLabels: ['vip'],
@@ -189,6 +190,7 @@ describe('#mutations', () => {
       expect(state.uiFlags.isAgentTyping).toBe(false);
       expect(state.uiFlags.isCreating).toBe(false);
       expect(state.uiFlags.isAwaitingCampaign).toBe(false);
+      expect(state.uiFlags.hasLoadFailed).toBe(false);
       expect(state.pendingCustomAttributes).toEqual({});
       expect(state.pendingLabels).toEqual([]);
     });

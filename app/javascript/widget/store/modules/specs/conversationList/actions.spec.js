@@ -159,9 +159,26 @@ describe('#actions', () => {
 
     it('does nothing when the conversation is already open', async () => {
       const rootState = { conversationAttributes: { id: 2 } };
-      await actions.open({ state: {}, commit, dispatch, rootState }, 2);
+      const rootGetters = { 'conversation/getHasLoadFailed': false };
+      await actions.open(
+        { state: {}, commit, dispatch, rootState, rootGetters },
+        2
+      );
       expect(commit).not.toBeCalled();
       expect(dispatch).not.toBeCalled();
+    });
+
+    it('retries the first page of the open conversation when it failed to load', async () => {
+      const rootState = { conversationAttributes: { id: 2 } };
+      const rootGetters = { 'conversation/getHasLoadFailed': true };
+      await actions.open(
+        { state: {}, commit, dispatch, rootState, rootGetters },
+        2
+      );
+      expect(commit).not.toBeCalled();
+      expect(dispatch.mock.calls).toEqual([
+        ['conversation/fetchOldConversations', {}, { root: true }],
+      ]);
     });
   });
 

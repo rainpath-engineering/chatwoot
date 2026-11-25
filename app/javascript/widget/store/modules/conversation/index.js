@@ -13,6 +13,8 @@ const state = {
     isAgentTyping: false,
     isCreating: false,
     isAwaitingCampaign: false,
+    // The first page of the thread on screen failed to load, so reopening it must retry.
+    hasLoadFailed: false,
   },
   lastMessageId: null,
   pendingCustomAttributes: {},
