@@ -68,6 +68,7 @@ describe('#actions', () => {
       );
       expect(dispatch.mock.calls).toEqual([
         ['get'],
+        ['conversationList/switchIdentity', {}, { root: true }],
         ['conversationList/load', {}, { root: true }],
       ]);
     });
