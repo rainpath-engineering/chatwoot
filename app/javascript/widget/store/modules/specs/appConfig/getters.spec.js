@@ -67,4 +67,12 @@ describe('#getters', () => {
       expect(getters.getIsUpdatingRoute(state)).toEqual(true);
     });
   });
+  describe('#getLinkInterceptOrigins', () => {
+    it('returns correct value', () => {
+      const state = { linkInterceptOrigins: ['https://app.example.com'] };
+      expect(getters.getLinkInterceptOrigins(state)).toEqual([
+        'https://app.example.com',
+      ]);
+    });
+  });
 });

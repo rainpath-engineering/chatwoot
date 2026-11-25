@@ -40,4 +40,14 @@ describe('#mutations', () => {
       expect(state.isUpdatingRoute).toEqual(true);
     });
   });
+
+  describe('#SET_WIDGET_APP_CONFIG', () => {
+    it('sets the link interception origins', () => {
+      const state = { linkInterceptOrigins: [] };
+      mutations.SET_WIDGET_APP_CONFIG(state, {
+        linkInterceptOrigins: ['https://app.example.com'],
+      });
+      expect(state.linkInterceptOrigins).toEqual(['https://app.example.com']);
+    });
+  });
 });
