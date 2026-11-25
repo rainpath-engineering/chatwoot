@@ -3,6 +3,7 @@ import {
   createTemporaryMessage,
   getNonDeletedMessages,
   groupConversationBySender,
+  hasLeftConversation,
 } from '../../conversation/helpers';
 
 describe('#findUndeliveredMessage', () => {
@@ -99,5 +100,23 @@ describe('#groupConversationBySender', () => {
     expect(
       groupConversationBySender(messages).map(message => message.showAvatar)
     ).toEqual([true, true]);
+  });
+});
+
+describe('#hasLeftConversation', () => {
+  afterEach(() => {
+    delete window.chatwootWebChannel;
+  });
+
+  it('is true when another thread took the screen with multiple conversations enabled', () => {
+    window.chatwootWebChannel = { enabledFeatures: ['multiple_conversations'] };
+    const rootState = { conversationList: { thread: 2 } };
+    expect(hasLeftConversation(rootState, 1)).toBe(true);
+    expect(hasLeftConversation(rootState, 2)).toBe(false);
+  });
+
+  it('is false with multiple conversations disabled', () => {
+    const rootState = { conversationList: { thread: 2 } };
+    expect(hasLeftConversation(rootState, 1)).toBe(false);
   });
 });
