@@ -129,6 +129,20 @@ index 8fd2ba11816b3ec55ce8689cf6d58df419109134..a9072b0e4be4e1ecac314f4c4680410c
      },
      "SETTINGS_POPUP": {
        "MESSENGER_HEADING": "Messenger Script",
+diff --git a/app/javascript/dashboard/i18n/locale/fr/inboxMgmt.json b/app/javascript/dashboard/i18n/locale/fr/inboxMgmt.json
+index c3f7371691eeab8a6ce1aadc6704b1585acd1cdf..a438dee90df57168b0ce5bae8a4672aca04cfe80 100644
+--- a/app/javascript/dashboard/i18n/locale/fr/inboxMgmt.json
++++ b/app/javascript/dashboard/i18n/locale/fr/inboxMgmt.json
+@@ -1091,7 +1091,8 @@
+       "DISPLAY_FILE_PICKER": "Afficher le sélecteur de fichiers sur le widget",
+       "DISPLAY_EMOJI_PICKER": "Afficher le sélecteur d'émoticônes sur le widget",
+       "ALLOW_END_CONVERSATION": "Permettre aux utilisateurs de terminer la conversation depuis le widget",
+-      "USE_INBOX_AVATAR_FOR_BOT": "Utiliser le nom de la boîte de réception et l'avatar pour le bot"
++      "USE_INBOX_AVATAR_FOR_BOT": "Utiliser le nom de la boîte de réception et l'avatar pour le bot",
++      "ALLOW_MULTIPLE_CONVERSATIONS": "Permettre aux utilisateurs d'avoir plusieurs conversations depuis le widget"
+     },
+     "SETTINGS_POPUP": {
+       "MESSENGER_HEADING": "Script du Widget Web",
 diff --git a/app/javascript/dashboard/routes/dashboard/settings/inbox/Settings.vue b/app/javascript/dashboard/routes/dashboard/settings/inbox/Settings.vue
 index 79ec2eac4e86f9feae2081e6e5e94e290e7ad4cc..94016c9e6d7191a8631aa635ede7278b1f52bd12 100644
 --- a/app/javascript/dashboard/routes/dashboard/settings/inbox/Settings.vue
@@ -2139,6 +2153,31 @@ index 0cfc9d00a62c08b6cbc9bf98bf260ebedc63398f..f7ddb74555a7fb9359408a16bf73099d
    "VIEW_UNREAD_MESSAGES": "You have unread messages",
    "UNREAD_VIEW": {
      "VIEW_MESSAGES_BUTTON": "See new messages",
+diff --git a/app/javascript/widget/i18n/locale/fr.json b/app/javascript/widget/i18n/locale/fr.json
+index 6a284c3f988f409c1868e0aff148064944b62f87..055b44529ed4f3dcb9df3b769df4444bb3313420 100644
+--- a/app/javascript/widget/i18n/locale/fr.json
++++ b/app/javascript/widget/i18n/locale/fr.json
+@@ -47,6 +47,20 @@
+   "CONTINUE_CONVERSATION": "Continuer la conversation",
+   "YOU": "Vous",
+   "START_NEW_CONVERSATION": "Démarrer une nouvelle conversation",
++  "BACK": "Retour",
++  "TABS": {
++    "HOME": "Accueil",
++    "MESSAGES": "Messages",
++    "UNREAD_CONVERSATIONS": "{count} conversation non lue | {count} conversations non lues"
++  },
++  "CONVERSATIONS": {
++    "TITLE": "Toutes les conversations",
++    "EMPTY_TITLE": "Aucune conversation pour l'instant",
++    "EMPTY_DESCRIPTION": "Démarrez une conversation, nous vous répondrons ici.",
++    "RESOLVED": "Résolue",
++    "UNREAD_COUNT": "{count} message non lu | {count} messages non lus",
++    "ATTACHMENT": "Pièce jointe"
++  },
+   "VIEW_UNREAD_MESSAGES": "Vous avez des messages non lus",
+   "UNREAD_VIEW": {
+     "VIEW_MESSAGES_BUTTON": "Voir les nouveaux messages",
 diff --git a/app/javascript/widget/mixins/configMixin.js b/app/javascript/widget/mixins/configMixin.js
 index 7eb11e18b9fc55e057c4bd49bcdbf9519f55045a..0ae7c6a3711c7508f3336e313a0c5d37ea66de7e 100644
 --- a/app/javascript/widget/mixins/configMixin.js
