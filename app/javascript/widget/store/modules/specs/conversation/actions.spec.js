@@ -595,6 +595,26 @@ describe('#actions', () => {
             },
           ],
         ],
+        ['setConversationUIFlag', { hasLoadFailed: false }],
+        ['setConversationListLoading', false],
+      ]);
+    });
+
+    it('flags a failed first page so reopening the conversation retries it', async () => {
+      API.get.mockRejectedValue(new Error('Network Error'));
+      await actions.fetchOldConversations({ commit, rootState }, {});
+      expect(commit.mock.calls).toEqual([
+        ['setConversationListLoading', true],
+        ['setConversationUIFlag', { hasLoadFailed: true }],
+        ['setConversationListLoading', false],
+      ]);
+    });
+
+    it('leaves the flag alone when an older page fails', async () => {
+      API.get.mockRejectedValue(new Error('Network Error'));
+      await actions.fetchOldConversations({ commit, rootState }, { before: 5 });
+      expect(commit.mock.calls).toEqual([
+        ['setConversationListLoading', true],
         ['setConversationListLoading', false],
       ]);
     });

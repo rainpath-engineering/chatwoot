@@ -224,8 +224,11 @@ export const actions = {
       const formattedMessages = getNonDeletedMessages({ messages: payload });
       commit('conversation/setMetaUserLastSeenAt', lastSeen, { root: true });
       commit('setMessagesInConversation', formattedMessages);
+      if (!before) commit('setConversationUIFlag', { hasLoadFailed: false });
     } catch (error) {
-      // Ignore error
+      if (!before && !hasLeftConversation(rootState, thread)) {
+        commit('setConversationUIFlag', { hasLoadFailed: true });
+      }
     } finally {
       commit('setConversationListLoading', false);
     }
