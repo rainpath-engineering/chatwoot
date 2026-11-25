@@ -69,6 +69,7 @@ RSpec.describe '/api/v1/widget/conversations/toggle_typing', type: :request do
 
     before do
       allow(Rails.configuration.dispatcher).to receive(:dispatch)
+      web_widget.update!(multiple_conversations: true)
       create(:message, account: account, inbox: web_widget.inbox, conversation: conversation, content: 'visitor question')
       create(:message, account: account, inbox: web_widget.inbox, conversation: conversation, content: 'agent reply', message_type: :outgoing)
       create(:message, account: account, inbox: web_widget.inbox, conversation: conversation, content: 'private note',
@@ -495,6 +496,62 @@ RSpec.describe '/api/v1/widget/conversations/toggle_typing', type: :request do
         # conversation custom attributes should not have "product_name" key with value "Chatwoot"
         expect(conversation.custom_attributes).not_to include('product_name' => 'Chatwoot')
       end
+    end
+  end
+
+  describe 'naming an older conversation while multiple conversations are disabled' do
+    let!(:latest_conversation) do
+      create(:conversation, contact: contact, account: account, inbox: web_widget.inbox, contact_inbox: contact_inbox)
+    end
+    let(:older_params) { { website_token: web_widget.website_token, conversation_id: conversation.display_id } }
+
+    before do
+      allow(Rails.configuration.dispatcher).to receive(:dispatch)
+      web_widget.update!(multiple_conversations: false)
+    end
+
+    it 'returns the latest conversation' do
+      get '/api/v1/widget/conversations', headers: { 'X-Auth-Token' => token }, params: older_params, as: :json
+
+      expect(response.parsed_body['id']).to eq(latest_conversation.display_id)
+    end
+
+    it 'resolves the latest conversation only' do
+      get '/api/v1/widget/conversations/toggle_status', headers: { 'X-Auth-Token' => token }, params: older_params, as: :json
+
+      expect(latest_conversation.reload).to be_resolved
+      expect(conversation.reload).to be_open
+    end
+
+    it 'sets custom attributes on the latest conversation only' do
+      post '/api/v1/widget/conversations/set_custom_attributes',
+           headers: { 'X-Auth-Token' => token },
+           params: older_params.merge(custom_attributes: { plan: 'pro' }),
+           as: :json
+
+      expect(latest_conversation.reload.custom_attributes).to include('plan' => 'pro')
+      expect(conversation.reload.custom_attributes).not_to include('plan')
+    end
+
+    it 'marks the latest conversation as seen only' do
+      post '/api/v1/widget/conversations/update_last_seen', headers: { 'X-Auth-Token' => token }, params: older_params, as: :json
+
+      expect(latest_conversation.reload.contact_last_seen_at).to be_present
+      expect(conversation.reload.contact_last_seen_at).to be_nil
+    end
+
+    it 'lists the latest conversation only' do
+      create(:message, account: account, inbox: web_widget.inbox, conversation: conversation, content: 'older agent reply',
+                       message_type: :outgoing)
+      create(:message, account: account, inbox: web_widget.inbox, conversation: latest_conversation, content: 'latest agent reply',
+                       message_type: :outgoing)
+
+      get '/api/v1/widget/conversations/list', headers: { 'X-Auth-Token' => token }, params: older_params, as: :json
+
+      expect(response).to have_http_status(:success)
+      expect(response.parsed_body['payload'].pluck('id')).to eq([latest_conversation.display_id])
+      expect(response.parsed_body['payload'].first['last_message']['content']).to eq('latest agent reply')
+      expect(response.parsed_body['meta']).to eq('has_next_page' => false, 'unread_count' => 1)
     end
   end
 end

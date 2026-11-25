@@ -9,8 +9,9 @@ class Api::V1::Widget::ConversationsController < Api::V1::Widget::BaseController
   end
 
   def list
-    @unread_conversation_count = unread_messages_for(conversations.select(:id)).distinct.count(:conversation_id)
-    @conversations = conversations.includes(:assignee).order(last_activity_at: :desc, id: :desc).page(permitted_params[:page]).per(RESULTS_PER_PAGE)
+    @unread_conversation_count = unread_messages_for(listed_conversations.select(:id)).distinct.count(:conversation_id)
+    @conversations = listed_conversations.includes(:assignee).order(last_activity_at: :desc, id: :desc)
+                                         .page(permitted_params[:page]).per(RESULTS_PER_PAGE)
     @unread_counts = unread_messages_for(@conversations.map(&:id)).group(:conversation_id).count
     @last_messages = last_messages_for(@conversations)
   end
@@ -101,6 +102,13 @@ class Api::V1::Widget::ConversationsController < Api::V1::Widget::BaseController
 
   def trigger_typing_event(event)
     Rails.configuration.dispatcher.dispatch(event, Time.zone.now, conversation: conversation, user: @contact)
+  end
+
+  # With the feature off the widget exposes only the conversation every other endpoint acts on, the latest.
+  def listed_conversations
+    return conversations if @web_widget.multiple_conversations?
+
+    conversations.where(id: conversation&.id)
   end
 
   def unread_messages_for(conversation_ids)
