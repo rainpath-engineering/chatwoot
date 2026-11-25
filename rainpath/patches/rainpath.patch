@@ -167,11 +167,410 @@ index 79ec2eac4e86f9feae2081e6e5e94e290e7ad4cc..94016c9e6d7191a8631aa635ede7278b
                  </div>
                </SettingsFieldSection>
              </SettingsAccordion>
+diff --git a/app/javascript/entrypoints/sdk.js b/app/javascript/entrypoints/sdk.js
+index 6e1639b1c2d6bf3264ebac28005f6a9b9300935e..5a8fcf491b0a0de3075596596e0b621a2dbb69b6 100755
+--- a/app/javascript/entrypoints/sdk.js
++++ b/app/javascript/entrypoints/sdk.js
+@@ -17,6 +17,7 @@ import {
+ } from '../sdk/DOMHelpers';
+ import { setCookieWithDomain } from '../sdk/cookieHelpers';
+ import { SDK_SET_BUBBLE_VISIBILITY } from 'shared/constants/sharedFrameEvents';
++import { sanitizeLinkInterceptOrigins } from 'shared/helpers/linkInterceptHelper';
+ 
+ const runSDK = ({ baseUrl, websiteToken }) => {
+   if (window.$chatwoot) {
+@@ -79,6 +80,9 @@ const runSDK = ({ baseUrl, websiteToken }) => {
+     enableFileUpload: chatwootSettings.enableFileUpload,
+     enableEmojiPicker: chatwootSettings.enableEmojiPicker ?? true,
+     enableEndConversation: chatwootSettings.enableEndConversation ?? true,
++    linkInterceptOrigins: sanitizeLinkInterceptOrigins(
++      chatwootSettings.linkInterceptOrigins
++    ),
+ 
+     toggle(state) {
+       IFrameHelper.events.toggleBubble(state);
+diff --git a/app/javascript/sdk/IFrameHelper.js b/app/javascript/sdk/IFrameHelper.js
+index e38f4e02fbdcf66c091c32af7f57cb27d91cd1a8..3a9f7d34eef7337f87a7dd675fb0bb90926edb9f 100644
+--- a/app/javascript/sdk/IFrameHelper.js
++++ b/app/javascript/sdk/IFrameHelper.js
+@@ -24,6 +24,7 @@ import { isWidgetColorLighter } from 'shared/helpers/colorHelper';
+ import { dispatchWindowEvent } from 'shared/helpers/CustomEventHelper';
+ import {
+   CHATWOOT_ERROR,
++  CHATWOOT_LINK_CLICK,
+   CHATWOOT_POSTBACK,
+   CHATWOOT_READY,
+ } from '../widget/constants/sdkEvents';
+@@ -35,6 +36,7 @@ import {
+ } from 'shared/helpers/AudioNotificationHelper';
+ import { isFlatWidgetStyle } from './settingsHelper';
+ import { popoutChatWindow } from '../widget/helpers/popoutHelper';
++import { getInterceptedUrl } from 'shared/helpers/linkInterceptHelper';
+ 
+ const updateAuthCookie = (cookieContent, baseDomain = '') =>
+   setCookieWithDomain('cw_conversation', cookieContent, {
+@@ -172,6 +174,7 @@ export const IFrameHelper = {
+         enableFileUpload: window.$chatwoot.enableFileUpload,
+         enableEmojiPicker: window.$chatwoot.enableEmojiPicker,
+         enableEndConversation: window.$chatwoot.enableEndConversation,
++        linkInterceptOrigins: window.$chatwoot.linkInterceptOrigins,
+       });
+       IFrameHelper.onLoad({
+         widgetColor: message.config.channelConfig.widgetColor,
+@@ -221,6 +224,21 @@ export const IFrameHelper = {
+       });
+     },
+ 
++    // A link to one of the `linkInterceptOrigins` was clicked in the widget.
++    // The origin is checked again here: any frame of the page can post to it.
++    onLinkClick({ url }) {
++      const interceptedUrl = getInterceptedUrl(
++        url,
++        window.$chatwoot.linkInterceptOrigins
++      );
++      if (!interceptedUrl) return;
++
++      dispatchWindowEvent({
++        eventName: CHATWOOT_LINK_CLICK,
++        data: { url: interceptedUrl },
++      });
++    },
++
+     toggleBubble: state => {
+       let bubbleState = {};
+       if (state === 'open') {
+diff --git a/app/javascript/sdk/specs/IFrameHelper.spec.js b/app/javascript/sdk/specs/IFrameHelper.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d4b5017a2735016315356a6af8a97f472ee80ee
+--- /dev/null
++++ b/app/javascript/sdk/specs/IFrameHelper.spec.js
+@@ -0,0 +1,94 @@
++import { IFrameHelper } from '../IFrameHelper';
++
++// A script URL, the classic link injection payload.
++// eslint-disable-next-line no-script-url
++const SCRIPT_URL = 'javascript:alert(1)';
++
++describe('IFrameHelper link interception', () => {
++  let listener;
++
++  beforeEach(() => {
++    listener = vi.fn();
++    window.addEventListener('chatwoot:link-click', listener);
++    window.$chatwoot = { linkInterceptOrigins: ['https://app.example.com'] };
++  });
++
++  afterEach(() => {
++    window.removeEventListener('chatwoot:link-click', listener);
++    window.onmessage = null;
++    delete window.$chatwoot;
++  });
++
++  describe('#onLinkClick', () => {
++    it('dispatches chatwoot:link-click with the URL on the host window', () => {
++      IFrameHelper.events.onLinkClick({
++        event: 'onLinkClick',
++        url: 'https://app.example.com/settings/general',
++      });
++
++      expect(listener).toHaveBeenCalledTimes(1);
++      const [event] = listener.mock.calls[0];
++      expect(event).toBeInstanceOf(CustomEvent);
++      expect(event.detail).toEqual({
++        url: 'https://app.example.com/settings/general',
++      });
++    });
++
++    it('ignores a URL outside the configured origins', () => {
++      IFrameHelper.events.onLinkClick({ url: 'https://other.example.com/' });
++      IFrameHelper.events.onLinkClick({ url: SCRIPT_URL });
++      IFrameHelper.events.onLinkClick({ url: 42 });
++      IFrameHelper.events.onLinkClick({});
++
++      expect(listener).not.toHaveBeenCalled();
++    });
++
++    it('ignores every URL when no origin is configured', () => {
++      window.$chatwoot = { linkInterceptOrigins: [] };
++      IFrameHelper.events.onLinkClick({ url: 'https://app.example.com/' });
++
++      expect(listener).not.toHaveBeenCalled();
++    });
++
++    it('is reached through the widget post message channel', () => {
++      IFrameHelper.initPostMessageCommunication();
++      window.onmessage({
++        data: `chatwoot-widget:${JSON.stringify({
++          event: 'onLinkClick',
++          url: 'https://app.example.com/cases',
++        })}`,
++      });
++
++      expect(listener).toHaveBeenCalledTimes(1);
++      expect(listener.mock.calls[0][0].detail).toEqual({
++        url: 'https://app.example.com/cases',
++      });
++    });
++  });
++
++  describe('#loaded', () => {
++    it('forwards linkInterceptOrigins to the widget with the config', () => {
++      const sendMessage = vi
++        .spyOn(IFrameHelper, 'sendMessage')
++        .mockImplementation(() => {});
++      vi.spyOn(IFrameHelper, 'onLoad').mockImplementation(() => {});
++      vi.spyOn(IFrameHelper, 'toggleCloseButton').mockImplementation(() => {});
++      window.$chatwoot = {
++        baseUrl: 'https://chat.example.com',
++        linkInterceptOrigins: ['https://app.example.com'],
++        resetTriggered: true,
++      };
++
++      IFrameHelper.events.loaded({
++        config: { authToken: 'token', channelConfig: { widgetColor: '#000' } },
++      });
++
++      expect(sendMessage).toHaveBeenCalledWith(
++        'config-set',
++        expect.objectContaining({
++          linkInterceptOrigins: ['https://app.example.com'],
++        })
++      );
++    });
++  });
++});
+diff --git a/app/javascript/sdk/specs/sdkSettings.spec.js b/app/javascript/sdk/specs/sdkSettings.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..0380595b3c4dde15f4b65016376849d98450e241
+--- /dev/null
++++ b/app/javascript/sdk/specs/sdkSettings.spec.js
+@@ -0,0 +1,50 @@
++// A script URL, the classic link injection payload.
++// eslint-disable-next-line no-script-url
++const SCRIPT_URL = 'javascript:alert(1)';
++
++describe('chatwootSDK.run linkInterceptOrigins', () => {
++  beforeEach(() => {
++    vi.resetModules();
++    delete window.$chatwoot;
++  });
++
++  afterEach(() => {
++    delete window.$chatwoot;
++    delete window.chatwootSettings;
++    document.getElementById('cw-widget-holder')?.remove();
++  });
++
++  const runSDK = async () => {
++    await import('../../entrypoints/sdk');
++    window.chatwootSDK.run({
++      baseUrl: 'https://chat.example.com',
++      websiteToken: 'website-token',
++    });
++  };
++
++  it('keeps only the valid origins of the setting', async () => {
++    window.chatwootSettings = {
++      linkInterceptOrigins: [
++        'https://app.example.com',
++        'http://localhost:5173',
++        'http://app.example.com',
++        SCRIPT_URL,
++      ],
++    };
++
++    await runSDK();
++
++    expect(window.$chatwoot.linkInterceptOrigins).toEqual([
++      'https://app.example.com',
++      'http://localhost:5173',
++    ]);
++  });
++
++  it('defaults to no interception', async () => {
++    window.chatwootSettings = {};
++
++    await runSDK();
++
++    expect(window.$chatwoot.linkInterceptOrigins).toEqual([]);
++  });
++});
+diff --git a/app/javascript/shared/helpers/linkInterceptHelper.js b/app/javascript/shared/helpers/linkInterceptHelper.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4edd1c732d48c6b77f3736e34ec8396ea79f09c
+--- /dev/null
++++ b/app/javascript/shared/helpers/linkInterceptHelper.js
+@@ -0,0 +1,52 @@
++// Link interception lets the page embedding the widget handle clicks on links
++// to its own origins (for example to navigate inside a single page app)
++// instead of opening them in a new tab. The host opts in with
++// `window.chatwootSettings.linkInterceptOrigins`.
++
++const isAllowedProtocol = url =>
++  url.protocol === 'https:' ||
++  (url.protocol === 'http:' && url.hostname === 'localhost');
++
++const parseOrigin = value => {
++  if (typeof value !== 'string') return null;
++  let url;
++  try {
++    url = new URL(value);
++  } catch {
++    return null;
++  }
++  if (!isAllowedProtocol(url)) return null;
++  // An origin only: no credentials, path, query string or fragment.
++  if (url.username || url.password) return null;
++  if (url.pathname !== '/' || url.search || url.hash) return null;
++  return url.origin;
++};
++
++/**
++ * Keeps the valid origins of a `linkInterceptOrigins` setting: `https:`
++ * origins, plus `http://localhost` on any port for local development.
++ * Anything else is dropped. Returns a deduplicated list of normalized origins.
++ */
++export const sanitizeLinkInterceptOrigins = origins => {
++  if (!Array.isArray(origins)) return [];
++  return origins.reduce((result, value) => {
++    const origin = parseOrigin(value);
++    if (origin && !result.includes(origin)) result.push(origin);
++    return result;
++  }, []);
++};
++
++/**
++ * Returns the absolute URL of `href` when its origin is one of `origins`,
++ * otherwise null.
++ */
++export const getInterceptedUrl = (href, origins) => {
++  if (typeof href !== 'string' || !origins?.length) return null;
++  let url;
++  try {
++    url = new URL(href);
++  } catch {
++    return null;
++  }
++  return origins.includes(url.origin) ? url.href : null;
++};
+diff --git a/app/javascript/shared/helpers/specs/linkInterceptHelper.spec.js b/app/javascript/shared/helpers/specs/linkInterceptHelper.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..986082b208c97d99acfd8331a914f70d4c249162
+--- /dev/null
++++ b/app/javascript/shared/helpers/specs/linkInterceptHelper.spec.js
+@@ -0,0 +1,99 @@
++import {
++  getInterceptedUrl,
++  sanitizeLinkInterceptOrigins,
++} from '../linkInterceptHelper';
++
++// A script URL, the classic link injection payload.
++// eslint-disable-next-line no-script-url
++const SCRIPT_URL = 'javascript:alert(1)';
++
++describe('#sanitizeLinkInterceptOrigins', () => {
++  it('returns an empty list when the setting is missing or not an array', () => {
++    expect(sanitizeLinkInterceptOrigins(undefined)).toEqual([]);
++    expect(sanitizeLinkInterceptOrigins(null)).toEqual([]);
++    expect(sanitizeLinkInterceptOrigins('https://app.example.com')).toEqual([]);
++    expect(
++      sanitizeLinkInterceptOrigins({ 0: 'https://a.example.com' })
++    ).toEqual([]);
++  });
++
++  it('keeps https origins and normalizes them', () => {
++    expect(
++      sanitizeLinkInterceptOrigins([
++        'https://app.example.com',
++        'https://App.Example.com/',
++        'https://app.example.com:8443',
++      ])
++    ).toEqual(['https://app.example.com', 'https://app.example.com:8443']);
++  });
++
++  it('keeps http://localhost on any port for development', () => {
++    expect(
++      sanitizeLinkInterceptOrigins([
++        'http://localhost',
++        'http://localhost:5173',
++      ])
++    ).toEqual(['http://localhost', 'http://localhost:5173']);
++  });
++
++  it('drops insecure, non web and malformed origins', () => {
++    expect(
++      sanitizeLinkInterceptOrigins([
++        'http://app.example.com',
++        'http://localhost.example.com',
++        'http://127.0.0.1:3000',
++        SCRIPT_URL,
++        'data:text/html,hello',
++        'file:///etc/passwd',
++        'ftp://app.example.com',
++        'app.example.com',
++        '*',
++        '',
++        42,
++        null,
++        {},
++      ])
++    ).toEqual([]);
++  });
++
++  it('drops values that are more than an origin', () => {
++    expect(
++      sanitizeLinkInterceptOrigins([
++        'https://app.example.com/settings',
++        'https://app.example.com/?a=1',
++        'https://app.example.com/#top',
++        'https://user:secret@app.example.com',
++      ])
++    ).toEqual([]);
++  });
++});
++
++describe('#getInterceptedUrl', () => {
++  const origins = ['https://app.example.com', 'http://localhost:5173'];
++
++  it('returns the absolute URL of a link to a listed origin', () => {
++    expect(
++      getInterceptedUrl('https://app.example.com/settings/general', origins)
++    ).toEqual('https://app.example.com/settings/general');
++    expect(getInterceptedUrl('http://localhost:5173/cases', origins)).toEqual(
++      'http://localhost:5173/cases'
++    );
++  });
++
++  it('returns null for any other link', () => {
++    expect(getInterceptedUrl('https://other.example.com/', origins)).toBeNull();
++    expect(
++      getInterceptedUrl('https://app.example.com.evil.test/', origins)
++    ).toBeNull();
++    expect(getInterceptedUrl('http://app.example.com/', origins)).toBeNull();
++    expect(getInterceptedUrl('http://localhost:3000/', origins)).toBeNull();
++    expect(getInterceptedUrl(SCRIPT_URL, origins)).toBeNull();
++    expect(getInterceptedUrl('not a url', origins)).toBeNull();
++    expect(getInterceptedUrl(undefined, origins)).toBeNull();
++  });
++
++  it('returns null when no origin is listed', () => {
++    expect(getInterceptedUrl('https://app.example.com/', [])).toBeNull();
++    expect(getInterceptedUrl('https://app.example.com/', undefined)).toBeNull();
++  });
++});
 diff --git a/app/javascript/widget/App.vue b/app/javascript/widget/App.vue
-index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd6de70650 100755
+index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..8aa731774f6962370015f3a5b726786f3394c2f9 100755
 --- a/app/javascript/widget/App.vue
 +++ b/app/javascript/widget/App.vue
-@@ -52,9 +52,22 @@ export default {
+@@ -22,6 +22,7 @@ import { useRouter } from 'vue-router';
+ import { useAvailability } from 'widget/composables/useAvailability';
+ import { SDK_SET_BUBBLE_VISIBILITY } from '../shared/constants/sharedFrameEvents';
+ import { emitter } from 'shared/helpers/mitt';
++import { handleMessageLinkClick } from './helpers/linkInterceptHelper';
+ 
+ export default {
+   name: 'App',
+@@ -52,9 +53,23 @@ export default {
        isWidgetOpen: 'appConfig/getIsWidgetOpen',
        messageCount: 'conversation/getMessageCount',
        unreadMessageCount: 'conversation/getUnreadMessageCount',
@@ -179,6 +578,7 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
 +      latestConversation: 'conversationList/getLatestConversation',
        isWidgetStyleFlat: 'appConfig/isWidgetStyleFlat',
        showUnreadMessagesDialog: 'appConfig/getShowUnreadMessagesDialog',
++      linkInterceptOrigins: 'appConfig/getLinkInterceptOrigins',
      }),
 +    totalUnreadCount() {
 +      return this.unreadMessageCount + this.otherConversationsUnreadCount;
@@ -194,7 +594,7 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
      isIFrame() {
        return IFrameHelper.isIFrame();
      },
-@@ -76,7 +89,7 @@ export default {
+@@ -76,7 +91,7 @@ export default {
      },
      // Keep the notification dot in sync with the unread count. The SDK ignores
      // dot updates while the bubble is hidden, so refresh it when it is back.
@@ -203,8 +603,11 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
        this.handleUnreadNotificationDot();
      },
      hideMessageBubble() {
-@@ -99,7 +112,7 @@ export default {
+@@ -97,9 +112,10 @@ export default {
+     setHeader(window.authToken);
+     if (this.isIFrame) {
        this.registerListeners();
++      document.addEventListener('click', this.onMessageLinkClick);
        this.sendLoadedEvent();
      } else {
 -      this.fetchOldConversations();
@@ -212,7 +615,7 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
        this.fetchAvailableAgents(websiteToken);
        this.setLocale(getLocale(window.location.search));
      }
-@@ -107,7 +120,9 @@ export default {
+@@ -107,10 +123,15 @@ export default {
        this.registerListeners();
        this.sendRNWebViewLoadedEvent();
      }
@@ -223,7 +626,13 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
      this.registerUnreadEvents();
      this.registerCampaignEvents();
    },
-@@ -126,6 +141,22 @@ export default {
++  beforeUnmount() {
++    document.removeEventListener('click', this.onMessageLinkClick);
++  },
+   methods: {
+     ...mapActions('appConfig', [
+       'setAppConfig',
+@@ -126,6 +147,26 @@ export default {
        'resetCampaign',
      ]),
      ...mapActions('agent', ['fetchAvailableAgents']),
@@ -243,10 +652,14 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
 +      }
 +      return undefined;
 +    },
++    // Links to the origins the host page asked for are handed to it.
++    onMessageLinkClick(event) {
++      handleMessageLinkClick(event, this.linkInterceptOrigins);
++    },
      setWidgetColorVariable(widgetColor) {
        if (widgetColor) {
          document.documentElement.style.setProperty(
-@@ -186,7 +217,10 @@ export default {
+@@ -186,7 +227,10 @@ export default {
        });
      },
      registerCampaignEvents() {
@@ -258,7 +671,7 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
          if (this.shouldShowPreChatForm) {
            this.router.replace({ name: 'prechat-form' });
          } else {
-@@ -214,7 +248,7 @@ export default {
+@@ -214,7 +258,7 @@ export default {
          this.campaignsSnoozedTill && this.campaignsSnoozedTill > Date.now();
        const isCampaignReadyToExecute =
          !isEmptyObject(activeCampaign) &&
@@ -267,7 +680,7 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
          !shouldSnoozeCampaign;
        if (this.isIFrame && isCampaignReadyToExecute) {
          this.router.replace({ name: 'campaigns' }).then(() => {
-@@ -248,11 +282,10 @@ export default {
+@@ -248,11 +292,10 @@ export default {
        }
      },
      handleUnreadNotificationDot() {
@@ -280,7 +693,7 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
          });
        }
      },
-@@ -277,7 +310,7 @@ export default {
+@@ -277,7 +320,7 @@ export default {
          if (message.event === 'config-set') {
            this.setLocale(message.locale);
            this.setBubbleLabel();
@@ -289,7 +702,7 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
            this.fetchAvailableAgents(websiteToken);
            this.setAppConfig(message);
            this.$store.dispatch('contacts/get');
-@@ -332,6 +365,7 @@ export default {
+@@ -332,6 +375,7 @@ export default {
            this.$store.dispatch('appConfig/toggleWidgetOpen', message.isOpen);
  
            const shouldShowMessageView =
@@ -297,7 +710,7 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
              ['home'].includes(this.$route.name) &&
              message.isOpen &&
              this.messageCount;
-@@ -372,8 +406,8 @@ export default {
+@@ -372,8 +416,8 @@ export default {
  
  <template>
    <div
@@ -308,7 +721,7 @@ index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd
      :class="{ dark: prefersDarkMode }"
    >
      <Spinner size="" />
-@@ -386,7 +420,7 @@ export default {
+@@ -386,7 +430,7 @@ export default {
        'is-widget-right': isRightAligned,
        'is-bubble-hidden': hideMessageBubble,
        'is-flat-design': isWidgetStyleFlat,
@@ -1428,6 +1841,76 @@ index 0000000000000000000000000000000000000000..0bd2bf00c156358727dc0eb23234a992
 +    expect(wrapper.emitted('select')).toEqual([[7]]);
 +  });
 +});
+diff --git a/app/javascript/widget/components/specs/MessageLinkIntercept.spec.js b/app/javascript/widget/components/specs/MessageLinkIntercept.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..17db8507d48ea3c47dff163b7dc1ab1246ff92c2
+--- /dev/null
++++ b/app/javascript/widget/components/specs/MessageLinkIntercept.spec.js
+@@ -0,0 +1,64 @@
++import { mount } from '@vue/test-utils';
++import VueDOMPurifyHTML from 'vue-dompurify-html';
++import { domPurifyConfig } from 'shared/helpers/HTMLSanitizer';
++import AgentMessageBubble from '../AgentMessageBubble.vue';
++import { handleMessageLinkClick } from '../../helpers/linkInterceptHelper';
++
++// Renders a real agent bubble (the markdown goes through MessageFormatter and
++// the widget's sanitizer) and clicks its link, with the delegated handler the
++// widget installs on document.
++describe('message link interception in an agent bubble', () => {
++  let sendMessage;
++  let listener;
++  let wrapper;
++
++  const mountBubble = message =>
++    mount(AgentMessageBubble, {
++      props: { message, messageType: 1, contentType: 'text' },
++      attachTo: document.body,
++      global: {
++        plugins: [[VueDOMPurifyHTML, domPurifyConfig]],
++        mocks: { $t: key => key },
++      },
++    });
++
++  const clickLink = () => {
++    const link = wrapper.find('.message-content a');
++    expect(link.exists()).toBe(true);
++    expect(link.attributes('target')).toBe('_blank');
++    const event = new MouseEvent('click', { bubbles: true, cancelable: true });
++    link.element.dispatchEvent(event);
++    return event;
++  };
++
++  beforeEach(() => {
++    sendMessage = vi.fn();
++    listener = event =>
++      handleMessageLinkClick(event, ['https://app.example.com'], sendMessage);
++    document.addEventListener('click', listener);
++  });
++
++  afterEach(() => {
++    document.removeEventListener('click', listener);
++    wrapper?.unmount();
++  });
++
++  it('hands a link to a listed origin to the host page', () => {
++    wrapper = mountBubble(
++      'Ouvrez [Paramètres > Général](https://app.example.com/settings/general).'
++    );
++
++    expect(clickLink().defaultPrevented).toBe(true);
++    expect(sendMessage).toHaveBeenCalledWith({
++      event: 'onLinkClick',
++      url: 'https://app.example.com/settings/general',
++    });
++  });
++
++  it('keeps the new tab behaviour for any other link', () => {
++    wrapper = mountBubble('Voir [la documentation](https://www.example.org/).');
++
++    expect(clickLink().defaultPrevented).toBe(false);
++    expect(sendMessage).not.toHaveBeenCalled();
++  });
++});
 diff --git a/app/javascript/widget/components/specs/TabBar.spec.js b/app/javascript/widget/components/specs/TabBar.spec.js
 new file mode 100644
 index 0000000000000000000000000000000000000000..511b37b2e691e7443a12fde741345fbab5c7ef75
@@ -1533,6 +2016,15 @@ index 218bab6f815a8db94d51e0345cf2f873dab7e8ff..027c5e4dcd676235d11be6eb64fbadc1
    >
      <div
        v-for="item in items"
+diff --git a/app/javascript/widget/constants/sdkEvents.js b/app/javascript/widget/constants/sdkEvents.js
+index 305aa16d7604f63976f6e32f45981410e3a3cf1c..030c8f1f4b42473b90c8132f89be0a38aa9ebb58 100644
+--- a/app/javascript/widget/constants/sdkEvents.js
++++ b/app/javascript/widget/constants/sdkEvents.js
+@@ -5,3 +5,4 @@ export const CHATWOOT_POSTBACK = 'chatwoot:postback';
+ export const CHATWOOT_READY = 'chatwoot:ready';
+ export const CHATWOOT_OPENED = 'chatwoot:opened';
+ export const CHATWOOT_CLOSED = 'chatwoot:closed';
++export const CHATWOOT_LINK_CLICK = 'chatwoot:link-click';
 diff --git a/app/javascript/widget/helpers/actionCable.js b/app/javascript/widget/helpers/actionCable.js
 index 5463170183f5314060311ba371aa779a2e9a11a7..3a9749ad8d7ff3c464c5dda952528667ace4e217 100644
 --- a/app/javascript/widget/helpers/actionCable.js
@@ -1724,6 +2216,47 @@ index 0369dae6221e5cbbf8b02937fe7da6ec134134f2..c5537d4df1c8893ba221a11532c9812f
  export const setHeader = (value, key = 'X-Auth-Token') => {
    API.defaults.headers.common[key] = value;
  };
+diff --git a/app/javascript/widget/helpers/linkInterceptHelper.js b/app/javascript/widget/helpers/linkInterceptHelper.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..4661a3b03fd149d2be23c3a042394af6319d4a8e
+--- /dev/null
++++ b/app/javascript/widget/helpers/linkInterceptHelper.js
+@@ -0,0 +1,35 @@
++import { getInterceptedUrl } from 'shared/helpers/linkInterceptHelper';
++import { IFrameHelper } from './utils';
++
++// Links rendered inside the content of an incoming message (agent or bot).
++const MESSAGE_CONTENT_SELECTOR = '.chat-bubble.agent .message-content';
++
++/**
++ * Delegated click handler for message links. When the clicked link points to
++ * one of `origins`, the default navigation (a new tab, as the message
++ * formatter renders links with `target=_blank`) is cancelled and the URL is
++ * handed to the host page through the SDK. Any other click is left alone.
++ * Keyboard activation (Enter on a focused link) dispatches the same click.
++ *
++ * Returns true when the click was intercepted.
++ */
++export const handleMessageLinkClick = (
++  event,
++  origins,
++  sendMessage = IFrameHelper.sendMessage
++) => {
++  if (!origins?.length || event.defaultPrevented) return false;
++
++  const { target } = event;
++  if (!target || typeof target.closest !== 'function') return false;
++
++  const link = target.closest('a[href]');
++  if (!link || !link.closest(MESSAGE_CONTENT_SELECTOR)) return false;
++
++  const url = getInterceptedUrl(link.href, origins);
++  if (!url) return false;
++
++  event.preventDefault();
++  sendMessage({ event: 'onLinkClick', url });
++  return true;
++};
 diff --git a/app/javascript/widget/helpers/specs/actionCable.spec.js b/app/javascript/widget/helpers/specs/actionCable.spec.js
 index 6aa3872bf14f18bd27f22f19420e5d52d4bd2cda..6c81975fe649564e4e75edb85e08a077771af213 100644
 --- a/app/javascript/widget/helpers/specs/actionCable.spec.js
@@ -2110,6 +2643,152 @@ index 0000000000000000000000000000000000000000..f59940dff513a5081064a51d9a3a3211
 +    expect(config.params).toEqual({ conversation_id: '' });
 +  });
 +});
+diff --git a/app/javascript/widget/helpers/specs/linkInterceptHelper.spec.js b/app/javascript/widget/helpers/specs/linkInterceptHelper.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..b0ff70063849ad50e6fee7c8b9abec8e14cf1ebd
+--- /dev/null
++++ b/app/javascript/widget/helpers/specs/linkInterceptHelper.spec.js
+@@ -0,0 +1,140 @@
++import { handleMessageLinkClick } from '../linkInterceptHelper';
++
++const ORIGINS = ['https://app.example.com'];
++
++const renderBubble = (html, bubbleClass = 'chat-bubble agent') => {
++  document.body.innerHTML = `
++    <div class="${bubbleClass}">
++      <div class="message-content">${html}</div>
++    </div>`;
++  return document.body.querySelector('a');
++};
++
++// A click as the browser dispatches it, for a pointer or for Enter on a
++// focused link (keyboard activation dispatches a click with detail 0).
++const click = (element, init = {}) => {
++  const event = new MouseEvent('click', {
++    bubbles: true,
++    cancelable: true,
++    ...init,
++  });
++  element.dispatchEvent(event);
++  return event;
++};
++
++describe('#handleMessageLinkClick', () => {
++  let sendMessage;
++  let listener;
++  let origins;
++
++  beforeEach(() => {
++    sendMessage = vi.fn();
++    origins = ORIGINS;
++    listener = event => handleMessageLinkClick(event, origins, sendMessage);
++    document.addEventListener('click', listener);
++  });
++
++  afterEach(() => {
++    document.removeEventListener('click', listener);
++    document.body.innerHTML = '';
++  });
++
++  it('intercepts a link to a listed origin in an agent message', () => {
++    const link = renderBubble(
++      '<p>Open <a href="https://app.example.com/settings/general" target="_blank" rel="noreferrer noopener nofollow">the settings</a></p>'
++    );
++
++    const event = click(link);
++
++    expect(event.defaultPrevented).toBe(true);
++    expect(sendMessage).toHaveBeenCalledWith({
++      event: 'onLinkClick',
++      url: 'https://app.example.com/settings/general',
++    });
++  });
++
++  it('intercepts a click on an element nested in the link', () => {
++    renderBubble(
++      '<a href="https://app.example.com/cases" target="_blank"><strong>Cases</strong></a>'
++    );
++
++    const event = click(document.body.querySelector('strong'));
++
++    expect(event.defaultPrevented).toBe(true);
++    expect(sendMessage).toHaveBeenCalledWith({
++      event: 'onLinkClick',
++      url: 'https://app.example.com/cases',
++    });
++  });
++
++  it('intercepts keyboard activation of a focused link', () => {
++    const link = renderBubble(
++      '<a href="https://app.example.com/settings" target="_blank">Settings</a>'
++    );
++    link.focus();
++
++    const event = click(link, { detail: 0 });
++
++    expect(document.activeElement).toBe(link);
++    expect(event.defaultPrevented).toBe(true);
++    expect(sendMessage).toHaveBeenCalledTimes(1);
++  });
++
++  it('leaves a link to another origin alone', () => {
++    const link = renderBubble(
++      '<a href="https://www.example.org/docs" target="_blank">Docs</a>'
++    );
++
++    const event = click(link);
++
++    expect(event.defaultPrevented).toBe(false);
++    expect(sendMessage).not.toHaveBeenCalled();
++  });
++
++  it('leaves a lookalike or downgraded origin alone', () => {
++    ['https://app.example.com.evil.test/', 'http://app.example.com/'].forEach(
++      href => {
++        const link = renderBubble(`<a href="${href}">Link</a>`);
++        expect(click(link).defaultPrevented).toBe(false);
++      }
++    );
++    expect(sendMessage).not.toHaveBeenCalled();
++  });
++
++  it('leaves every link alone when no origin is configured', () => {
++    origins = [];
++    const link = renderBubble(
++      '<a href="https://app.example.com/settings" target="_blank">Settings</a>'
++    );
++
++    expect(click(link).defaultPrevented).toBe(false);
++    expect(sendMessage).not.toHaveBeenCalled();
++  });
++
++  it('leaves links outside an incoming message alone', () => {
++    const userLink = renderBubble(
++      '<a href="https://app.example.com/settings">Settings</a>',
++      'chat-bubble user'
++    );
++    expect(click(userLink).defaultPrevented).toBe(false);
++
++    document.body.innerHTML =
++      '<footer><a href="https://app.example.com/">Powered by</a></footer>';
++    expect(click(document.body.querySelector('a')).defaultPrevented).toBe(
++      false
++    );
++
++    expect(sendMessage).not.toHaveBeenCalled();
++  });
++
++  it('ignores a click that was already handled', () => {
++    const link = renderBubble(
++      '<a href="https://app.example.com/settings">Settings</a>'
++    );
++    link.addEventListener('click', event => event.preventDefault());
++
++    click(link);
++
++    expect(sendMessage).not.toHaveBeenCalled();
++  });
++});
 diff --git a/app/javascript/widget/helpers/utils.js b/app/javascript/widget/helpers/utils.js
 index 67906d4ee39818ac014421d207a41bde886fbe41..937539b2760b0179c451a26b0657b7415eaddd1d 100755
 --- a/app/javascript/widget/helpers/utils.js
@@ -2229,6 +2908,55 @@ index 22115d5b1b4a019783309100198631f444765c64..ee4ee601116901a836a1f803f8e32ff5
      events,
      globalConfig,
      message,
+diff --git a/app/javascript/widget/store/modules/appConfig.js b/app/javascript/widget/store/modules/appConfig.js
+index 5b720d9075e55116b5937835453b5e2756680b16..013ccec2d45f23e481d6f882db91310eddfee88e 100644
+--- a/app/javascript/widget/store/modules/appConfig.js
++++ b/app/javascript/widget/store/modules/appConfig.js
+@@ -1,3 +1,4 @@
++import { sanitizeLinkInterceptOrigins } from 'shared/helpers/linkInterceptHelper';
+ import {
+   SET_BUBBLE_VISIBILITY,
+   SET_COLOR_SCHEME,
+@@ -28,6 +29,7 @@ const state = {
+   enableFileUpload: undefined,
+   enableEmojiPicker: true,
+   enableEndConversation: true,
++  linkInterceptOrigins: [],
+ };
+ 
+ export const getters = {
+@@ -48,6 +50,7 @@ export const getters = {
+   getShouldShowFilePicker: $state => $state.enableFileUpload,
+   getShouldShowEmojiPicker: $state => $state.enableEmojiPicker,
+   getCanUserEndConversation: $state => $state.enableEndConversation,
++  getLinkInterceptOrigins: $state => $state.linkInterceptOrigins,
+ };
+ 
+ export const actions = {
+@@ -67,6 +70,7 @@ export const actions = {
+       enableFileUpload = undefined,
+       enableEmojiPicker = true,
+       enableEndConversation = true,
++      linkInterceptOrigins = [],
+     }
+   ) {
+     commit(SET_WIDGET_APP_CONFIG, {
+@@ -83,6 +87,7 @@ export const actions = {
+       enableFileUpload,
+       enableEmojiPicker,
+       enableEndConversation,
++      linkInterceptOrigins: sanitizeLinkInterceptOrigins(linkInterceptOrigins),
+     });
+   },
+   toggleWidgetOpen({ commit }, isWidgetOpen) {
+@@ -125,6 +130,7 @@ export const mutations = {
+     $state.enableFileUpload = data.enableFileUpload;
+     $state.enableEmojiPicker = data.enableEmojiPicker;
+     $state.enableEndConversation = data.enableEndConversation;
++    $state.linkInterceptOrigins = data.linkInterceptOrigins || [];
+   },
+   [TOGGLE_WIDGET_OPEN]($state, isWidgetOpen) {
+     $state.isWidgetOpen = isWidgetOpen;
 diff --git a/app/javascript/widget/store/modules/campaign.js b/app/javascript/widget/store/modules/campaign.js
 index 050189fe55bc2d7419c8aa092043e660d56689c2..e08213a9dcc8d50532bb71ac477d5d2f7ba48e54 100644
 --- a/app/javascript/widget/store/modules/campaign.js
@@ -2860,6 +3588,86 @@ index 0000000000000000000000000000000000000000..d1606d43e7be50fd7d4e01b2b10e3717
 +  actions,
 +  mutations,
 +};
+diff --git a/app/javascript/widget/store/modules/specs/appConfig/actions.spec.js b/app/javascript/widget/store/modules/specs/appConfig/actions.spec.js
+index a990795626e6fb83aa628fd632024513b7085c5d..4780ff87c2b93fe3d9cdfe8ba51c83319ce632a5 100644
+--- a/app/javascript/widget/store/modules/specs/appConfig/actions.spec.js
++++ b/app/javascript/widget/store/modules/specs/appConfig/actions.spec.js
+@@ -1,5 +1,9 @@
+ import { actions } from '../../appConfig';
+ 
++// A script URL, the classic link injection payload.
++// eslint-disable-next-line no-script-url
++const SCRIPT_URL = 'javascript:alert(1)';
++
+ const commit = vi.fn();
+ describe('#actions', () => {
+   describe('#setReferrerHost', () => {
+@@ -38,4 +42,29 @@ describe('#actions', () => {
+       expect(commit.mock.calls).toEqual([['SET_ROUTE_UPDATE_STATE', false]]);
+     });
+   });
++
++  describe('#setAppConfig', () => {
++    it('keeps only the valid link interception origins', () => {
++      actions.setAppConfig(
++        { commit },
++        {
++          linkInterceptOrigins: [
++            'https://app.example.com',
++            'http://localhost:5173',
++            'http://app.example.com',
++            SCRIPT_URL,
++          ],
++        }
++      );
++      expect(commit.mock.calls[0][1].linkInterceptOrigins).toEqual([
++        'https://app.example.com',
++        'http://localhost:5173',
++      ]);
++    });
++
++    it('defaults to no link interception', () => {
++      actions.setAppConfig({ commit }, {});
++      expect(commit.mock.calls[0][1].linkInterceptOrigins).toEqual([]);
++    });
++  });
+ });
+diff --git a/app/javascript/widget/store/modules/specs/appConfig/getters.spec.js b/app/javascript/widget/store/modules/specs/appConfig/getters.spec.js
+index a6020cb844d6ec2acd1aa2363314464cd3efc20c..e2899c801e42410b284de935574947b98293b1ff 100644
+--- a/app/javascript/widget/store/modules/specs/appConfig/getters.spec.js
++++ b/app/javascript/widget/store/modules/specs/appConfig/getters.spec.js
+@@ -67,4 +67,12 @@ describe('#getters', () => {
+       expect(getters.getIsUpdatingRoute(state)).toEqual(true);
+     });
+   });
++  describe('#getLinkInterceptOrigins', () => {
++    it('returns correct value', () => {
++      const state = { linkInterceptOrigins: ['https://app.example.com'] };
++      expect(getters.getLinkInterceptOrigins(state)).toEqual([
++        'https://app.example.com',
++      ]);
++    });
++  });
+ });
+diff --git a/app/javascript/widget/store/modules/specs/appConfig/mutations.spec.js b/app/javascript/widget/store/modules/specs/appConfig/mutations.spec.js
+index e25fea36815f8a58d51e4df8009c792eaf6a3b93..241341bdcf3144948688670658a37fdf0886779b 100644
+--- a/app/javascript/widget/store/modules/specs/appConfig/mutations.spec.js
++++ b/app/javascript/widget/store/modules/specs/appConfig/mutations.spec.js
+@@ -40,4 +40,14 @@ describe('#mutations', () => {
+       expect(state.isUpdatingRoute).toEqual(true);
+     });
+   });
++
++  describe('#SET_WIDGET_APP_CONFIG', () => {
++    it('sets the link interception origins', () => {
++      const state = { linkInterceptOrigins: [] };
++      mutations.SET_WIDGET_APP_CONFIG(state, {
++        linkInterceptOrigins: ['https://app.example.com'],
++      });
++      expect(state.linkInterceptOrigins).toEqual(['https://app.example.com']);
++    });
++  });
+ });
 diff --git a/app/javascript/widget/store/modules/specs/campaign/actions.spec.js b/app/javascript/widget/store/modules/specs/campaign/actions.spec.js
 index 793ef6054ed0b28f2ad1a9b75ceef47ad776b989..851a6e0601d1dd5bd468ee1630544df8034513ea 100644
 --- a/app/javascript/widget/store/modules/specs/campaign/actions.spec.js
