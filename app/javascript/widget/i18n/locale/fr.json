@@ -47,6 +47,20 @@
   "CONTINUE_CONVERSATION": "Continuer la conversation",
   "YOU": "Vous",
   "START_NEW_CONVERSATION": "Démarrer une nouvelle conversation",
+  "BACK": "Retour",
+  "TABS": {
+    "HOME": "Accueil",
+    "MESSAGES": "Messages",
+    "UNREAD_CONVERSATIONS": "{count} conversation non lue | {count} conversations non lues"
+  },
+  "CONVERSATIONS": {
+    "TITLE": "Toutes les conversations",
+    "EMPTY_TITLE": "Aucune conversation pour l'instant",
+    "EMPTY_DESCRIPTION": "Démarrez une conversation, nous vous répondrons ici.",
+    "RESOLVED": "Résolue",
+    "UNREAD_COUNT": "{count} message non lu | {count} messages non lus",
+    "ATTACHMENT": "Pièce jointe"
+  },
   "VIEW_UNREAD_MESSAGES": "Vous avez des messages non lus",
   "UNREAD_VIEW": {
     "VIEW_MESSAGES_BUTTON": "Voir les nouveaux messages",
