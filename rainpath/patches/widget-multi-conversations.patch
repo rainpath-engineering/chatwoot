@@ -1,0 +1,4967 @@
+diff --git a/app/builders/campaigns/campaign_conversation_builder.rb b/app/builders/campaigns/campaign_conversation_builder.rb
+index 0e9b901056d8e3a8003907d298e2faad490c8aca..e7fc98095c006f1569515495718562405398466c 100644
+--- a/app/builders/campaigns/campaign_conversation_builder.rb
++++ b/app/builders/campaigns/campaign_conversation_builder.rb
+@@ -8,8 +8,7 @@ class Campaigns::CampaignConversationBuilder
+     ActiveRecord::Base.transaction do
+       @contact_inbox.lock!
+ 
+-      # We won't send campaigns if a conversation is already present
+-      raise 'Conversation already present' if @contact_inbox.reload.conversations.present?
++      raise 'Conversation already present' if single_conversation_widget? && @contact_inbox.reload.conversations.present?
+ 
+       @conversation = ::Conversation.create!(conversation_params)
+       Messages::MessageBuilder.new(@campaign.sender, @conversation, message_params).perform
+@@ -22,6 +21,10 @@ class Campaigns::CampaignConversationBuilder
+ 
+   private
+ 
++  def single_conversation_widget?
++    !@contact_inbox.inbox.channel.multiple_conversations?
++  end
++
+   def message_params
+     ActionController::Parameters.new({
+                                        content: @campaign.message,
+diff --git a/app/controllers/api/v1/widget/base_controller.rb b/app/controllers/api/v1/widget/base_controller.rb
+index 90f3728fbf5ce6597a592935bd5d4f146f9ae434..25cadc24a5013fb1ebdfe5e6570b0e3d901b76b5 100644
+--- a/app/controllers/api/v1/widget/base_controller.rb
++++ b/app/controllers/api/v1/widget/base_controller.rb
+@@ -17,7 +17,17 @@ class Api::V1::Widget::BaseController < ApplicationController
+   end
+ 
+   def conversation
+-    @conversation ||= conversations.last
++    @conversation ||= if !selects_conversation?
++                        conversations.last
++                      elsif params[:conversation_id].present?
++                        conversations.find_by!(display_id: params[:conversation_id])
++                      end
++  end
++
++  # Widgets running multiple conversations always send conversation_id, blank for a new one. With the
++  # feature off, or a widget loaded before it was enabled, requests act on the latest conversation.
++  def selects_conversation?
++    @web_widget.multiple_conversations? && params.key?(:conversation_id)
+   end
+ 
+   def create_conversation
+diff --git a/app/controllers/api/v1/widget/conversations_controller.rb b/app/controllers/api/v1/widget/conversations_controller.rb
+index 69588167449d08d4d3831ed1ea13f5193b17d8b8..0bd420417c2dfd3d33ddd2ea9609d7f13bff134b 100644
+--- a/app/controllers/api/v1/widget/conversations_controller.rb
++++ b/app/controllers/api/v1/widget/conversations_controller.rb
+@@ -2,10 +2,20 @@ class Api::V1::Widget::ConversationsController < Api::V1::Widget::BaseController
+   include Events::Types
+   before_action :render_not_found_if_empty, only: [:toggle_typing, :toggle_status, :set_custom_attributes, :destroy_custom_attributes]
+ 
++  RESULTS_PER_PAGE = 25
++
+   def index
+     @conversation = conversation
+   end
+ 
++  def list
++    @unread_conversation_count = unread_messages_for(listed_conversations.select(:id)).distinct.count(:conversation_id)
++    @conversations = listed_conversations.includes(:assignee).order(last_activity_at: :desc, id: :desc)
++                                         .page(permitted_params[:page]).per(RESULTS_PER_PAGE)
++    @unread_counts = unread_messages_for(@conversations.map(&:id)).group(:conversation_id).count
++    @last_messages = last_messages_for(@conversations)
++  end
++
+   def create
+     identify_action = nil
+     ActiveRecord::Base.transaction do
+@@ -94,13 +104,40 @@ class Api::V1::Widget::ConversationsController < Api::V1::Widget::BaseController
+     Rails.configuration.dispatcher.dispatch(event, Time.zone.now, conversation: conversation, user: @contact)
+   end
+ 
++  # With the feature off the widget exposes only the conversation every other endpoint acts on, the latest.
++  def listed_conversations
++    return conversations if @web_widget.multiple_conversations?
++
++    conversations.where(id: conversation&.id)
++  end
++
++  def unread_messages_for(conversation_ids)
++    Message.joins(:conversation)
++           .where(conversation_id: conversation_ids)
++           .outgoing
++           .where(private: false)
++           .not_deleted
++           .where('messages.created_at > COALESCE(conversations.contact_last_seen_at, to_timestamp(0))')
++           .reorder(nil)
++  end
++
++  def last_messages_for(conversations)
++    Message.where(conversation_id: conversations.map(&:id))
++           .chat
++           .not_deleted
++           .select('DISTINCT ON (conversation_id) messages.*')
++           .reorder(:conversation_id, created_at: :desc, id: :desc)
++           .includes(:attachments, :sender, :conversation)
++           .index_by(&:conversation_id)
++  end
++
+   def render_not_found_if_empty
+     return head :not_found if conversation.nil?
+   end
+ 
+   def permitted_params
+-    params.permit(:id, :typing_status, :website_token, :email, contact: [:name, :email, :phone_number, { custom_attributes: {} }],
+-                                                               message: [:content, :referer_url, :timestamp, :echo_id],
+-                                                               custom_attributes: {})
++    params.permit(:id, :page, :typing_status, :website_token, :email, contact: [:name, :email, :phone_number, { custom_attributes: {} }],
++                                                                      message: [:content, :referer_url, :timestamp, :echo_id],
++                                                                      custom_attributes: {})
+   end
+ end
+diff --git a/app/javascript/dashboard/i18n/locale/en/inboxMgmt.json b/app/javascript/dashboard/i18n/locale/en/inboxMgmt.json
+index 8fd2ba11816b3ec55ce8689cf6d58df419109134..a9072b0e4be4e1ecac314f4c4680410cfb4cf1c3 100644
+--- a/app/javascript/dashboard/i18n/locale/en/inboxMgmt.json
++++ b/app/javascript/dashboard/i18n/locale/en/inboxMgmt.json
+@@ -1225,7 +1225,8 @@
+       "DISPLAY_FILE_PICKER": "Display file picker on the widget",
+       "DISPLAY_EMOJI_PICKER": "Display emoji picker on the widget",
+       "ALLOW_END_CONVERSATION": "Allow users to end conversation from the widget",
+-      "USE_INBOX_AVATAR_FOR_BOT": "Use inbox name and avatar for the bot"
++      "USE_INBOX_AVATAR_FOR_BOT": "Use inbox name and avatar for the bot",
++      "ALLOW_MULTIPLE_CONVERSATIONS": "Allow users to have multiple conversations from the widget"
+     },
+     "SETTINGS_POPUP": {
+       "MESSENGER_HEADING": "Messenger Script",
+diff --git a/app/javascript/dashboard/routes/dashboard/settings/inbox/Settings.vue b/app/javascript/dashboard/routes/dashboard/settings/inbox/Settings.vue
+index 79ec2eac4e86f9feae2081e6e5e94e290e7ad4cc..94016c9e6d7191a8631aa635ede7278b1f52bd12 100644
+--- a/app/javascript/dashboard/routes/dashboard/settings/inbox/Settings.vue
++++ b/app/javascript/dashboard/routes/dashboard/settings/inbox/Settings.vue
+@@ -1335,6 +1335,19 @@ export default {
+                       {{ $t('INBOX_MGMT.FEATURES.USE_INBOX_AVATAR_FOR_BOT') }}
+                     </label>
+                   </div>
++                  <div class="flex gap-2 py-0.5">
++                    <input
++                      v-model="selectedFeatureFlags"
++                      type="checkbox"
++                      value="multiple_conversations"
++                      @input="handleFeatureFlag"
++                    />
++                    <label for="multiple_conversations">
++                      {{
++                        $t('INBOX_MGMT.FEATURES.ALLOW_MULTIPLE_CONVERSATIONS')
++                      }}
++                    </label>
++                  </div>
+                 </div>
+               </SettingsFieldSection>
+             </SettingsAccordion>
+diff --git a/app/javascript/widget/App.vue b/app/javascript/widget/App.vue
+index 1ac36dfdf71a73331149a29c14ce622de16c4fdb..9c383dbb053132e23748ef1495c536dd6de70650 100755
+--- a/app/javascript/widget/App.vue
++++ b/app/javascript/widget/App.vue
+@@ -52,9 +52,22 @@ export default {
+       isWidgetOpen: 'appConfig/getIsWidgetOpen',
+       messageCount: 'conversation/getMessageCount',
+       unreadMessageCount: 'conversation/getUnreadMessageCount',
++      otherConversationsUnreadCount: 'conversationList/getUnreadCount',
++      latestConversation: 'conversationList/getLatestConversation',
+       isWidgetStyleFlat: 'appConfig/isWidgetStyleFlat',
+       showUnreadMessagesDialog: 'appConfig/getShowUnreadMessagesDialog',
+     }),
++    totalUnreadCount() {
++      return this.unreadMessageCount + this.otherConversationsUnreadCount;
++    },
++    // Only a single-conversation widget takes over the screen while its first thread loads.
++    isLoadingFirstThread() {
++      return (
++        !this.hasMultipleConversationsEnabled &&
++        !this.conversationSize &&
++        this.isFetchingList
++      );
++    },
+     isIFrame() {
+       return IFrameHelper.isIFrame();
+     },
+@@ -76,7 +89,7 @@ export default {
+     },
+     // Keep the notification dot in sync with the unread count. The SDK ignores
+     // dot updates while the bubble is hidden, so refresh it when it is back.
+-    unreadMessageCount() {
++    totalUnreadCount() {
+       this.handleUnreadNotificationDot();
+     },
+     hideMessageBubble() {
+@@ -99,7 +112,7 @@ export default {
+       this.registerListeners();
+       this.sendLoadedEvent();
+     } else {
+-      this.fetchOldConversations();
++      this.loadConversations();
+       this.fetchAvailableAgents(websiteToken);
+       this.setLocale(getLocale(window.location.search));
+     }
+@@ -107,7 +120,9 @@ export default {
+       this.registerListeners();
+       this.sendRNWebViewLoadedEvent();
+     }
+-    this.$store.dispatch('conversationAttributes/getAttributes');
++    if (!this.hasMultipleConversationsEnabled) {
++      this.$store.dispatch('conversationAttributes/getAttributes');
++    }
+     this.registerUnreadEvents();
+     this.registerCampaignEvents();
+   },
+@@ -126,6 +141,22 @@ export default {
+       'resetCampaign',
+     ]),
+     ...mapActions('agent', ['fetchAvailableAgents']),
++    // Decide the opening screen while the widget is still closed so it does not jump from Home.
++    // Only Home is replaced; a campaign, unread preview or the visitor may have moved on meanwhile.
++    async loadConversations() {
++      if (!this.hasMultipleConversationsEnabled) {
++        return this.fetchOldConversations();
++      }
++      await this.$store.dispatch('conversationList/load');
++      if (
++        this.$route.name === 'home' &&
++        this.latestConversation?.status !== 'resolved' &&
++        this.messageCount
++      ) {
++        this.router.replace({ name: 'messages' });
++      }
++      return undefined;
++    },
+     setWidgetColorVariable(widgetColor) {
+       if (widgetColor) {
+         document.documentElement.style.setProperty(
+@@ -186,7 +217,10 @@ export default {
+       });
+     },
+     registerCampaignEvents() {
+-      emitter.on(ON_CAMPAIGN_MESSAGE_CLICK, () => {
++      emitter.on(ON_CAMPAIGN_MESSAGE_CLICK, async () => {
++        if (this.hasMultipleConversationsEnabled) {
++          await this.$store.dispatch('conversationList/startNew');
++        }
+         if (this.shouldShowPreChatForm) {
+           this.router.replace({ name: 'prechat-form' });
+         } else {
+@@ -214,7 +248,7 @@ export default {
+         this.campaignsSnoozedTill && this.campaignsSnoozedTill > Date.now();
+       const isCampaignReadyToExecute =
+         !isEmptyObject(activeCampaign) &&
+-        !messageCount &&
++        (this.hasMultipleConversationsEnabled || !messageCount) &&
+         !shouldSnoozeCampaign;
+       if (this.isIFrame && isCampaignReadyToExecute) {
+         this.router.replace({ name: 'campaigns' }).then(() => {
+@@ -248,11 +282,10 @@ export default {
+       }
+     },
+     handleUnreadNotificationDot() {
+-      const { unreadMessageCount } = this;
+       if (this.isIFrame) {
+         IFrameHelper.sendMessage({
+           event: 'handleNotificationDot',
+-          unreadMessageCount,
++          unreadMessageCount: this.totalUnreadCount,
+         });
+       }
+     },
+@@ -277,7 +310,7 @@ export default {
+         if (message.event === 'config-set') {
+           this.setLocale(message.locale);
+           this.setBubbleLabel();
+-          this.fetchOldConversations().then(() => this.setUnreadView());
++          this.loadConversations().then(() => this.setUnreadView());
+           this.fetchAvailableAgents(websiteToken);
+           this.setAppConfig(message);
+           this.$store.dispatch('contacts/get');
+@@ -332,6 +365,7 @@ export default {
+           this.$store.dispatch('appConfig/toggleWidgetOpen', message.isOpen);
+ 
+           const shouldShowMessageView =
++            !this.hasMultipleConversationsEnabled &&
+             ['home'].includes(this.$route.name) &&
+             message.isOpen &&
+             this.messageCount;
+@@ -372,8 +406,8 @@ export default {
+ 
+ <template>
+   <div
+-    v-if="!conversationSize && isFetchingList"
+-    class="flex items-center justify-center flex-1 h-full bg-n-background"
++    v-if="isLoadingFirstThread"
++    class="flex items-center justify-center flex-1 h-full bg-n-surface-1"
+     :class="{ dark: prefersDarkMode }"
+   >
+     <Spinner size="" />
+@@ -386,7 +420,7 @@ export default {
+       'is-widget-right': isRightAligned,
+       'is-bubble-hidden': hideMessageBubble,
+       'is-flat-design': isWidgetStyleFlat,
+-      'bg-n-slate-2 dark:bg-n-solid-1': !isUnreadOrCampaignView,
++      'bg-n-surface-1': !isUnreadOrCampaignView,
+       dark: prefersDarkMode,
+     }"
+   >
+diff --git a/app/javascript/widget/api/conversation.js b/app/javascript/widget/api/conversation.js
+index 05e81ff9fb19a87ab2a94a4a7c217e215fc031e2..800e1a2060b6047d53dc5c7453368e896b553ec1 100755
+--- a/app/javascript/widget/api/conversation.js
++++ b/app/javascript/widget/api/conversation.js
+@@ -9,24 +9,28 @@ const createConversationAPI = async content => {
+ const sendMessageAPI = async (
+   content,
+   replyTo = null,
+-  { customAttributes, labels } = {}
++  { customAttributes, labels, conversationId } = {}
+ ) => {
+   const urlData = endPoints.sendMessage(content, replyTo, {
+     customAttributes,
+     labels,
+   });
+-  return API.post(urlData.url, urlData.params);
++  return API.post(urlData.url, urlData.params, {
++    params: { conversation_id: conversationId },
++  });
+ };
+ 
+ const sendAttachmentAPI = async (
+   attachment,
+-  { customAttributes, labels } = {}
++  { customAttributes, labels, conversationId } = {}
+ ) => {
+   const urlData = endPoints.sendAttachment(attachment, {
+     customAttributes,
+     labels,
+   });
+-  return API.post(urlData.url, urlData.params);
++  return API.post(urlData.url, urlData.params, {
++    params: { conversation_id: conversationId },
++  });
+ };
+ 
+ const getMessagesAPI = async ({ before, after }) => {
+@@ -38,6 +42,12 @@ const getConversationAPI = async () => {
+   return API.get(`/api/v1/widget/conversations${window.location.search}`);
+ };
+ 
++const getConversationsAPI = async ({ page }) => {
++  return API.get(`/api/v1/widget/conversations/list${window.location.search}`, {
++    params: { page },
++  });
++};
++
+ const toggleTyping = async ({ typingStatus }) => {
+   return API.post(
+     `/api/v1/widget/conversations/toggle_typing${window.location.search}`,
+@@ -84,6 +94,7 @@ export {
+   createConversationAPI,
+   sendMessageAPI,
+   getConversationAPI,
++  getConversationsAPI,
+   getMessagesAPI,
+   sendAttachmentAPI,
+   toggleTyping,
+diff --git a/app/javascript/widget/assets/scss/woot.scss b/app/javascript/widget/assets/scss/woot.scss
+index 6d2ee7976a3fe4322774184ee0f4e6fcd489cc41..156e928a876eaa367bc35076fa84f70857713246 100755
+--- a/app/javascript/widget/assets/scss/woot.scss
++++ b/app/javascript/widget/assets/scss/woot.scss
+@@ -86,7 +86,7 @@ label {
+ input:not(.reset-base),
+ textarea:not(.reset-base) {
+   font-family: inherit;
+-  @apply rounded-lg box-border bg-n-background dark:bg-n-alpha-2 border-none outline outline-1 outline-offset-[-1px] outline-n-weak block text-base leading-[1.5] p-2.5 w-full text-n-slate-12 focus:outline-n-brand focus:ring-1 focus:ring-n-brand;
++  @apply rounded-lg box-border bg-n-surface-2 dark:bg-n-solid-2 border-none outline outline-1 outline-offset-[-1px] outline-n-weak block text-base leading-[1.5] p-2.5 w-full text-n-slate-12 focus:outline-n-brand focus:ring-1 focus:ring-n-brand;
+ 
+   &:disabled {
+     @apply opacity-40 cursor-not-allowed;
+@@ -102,7 +102,7 @@ textarea {
+ }
+ 
+ select:not(.reset-base) {
+-  @apply bg-n-background dark:bg-n-alpha-2 w-full p-2.5 border-none outline outline-1 outline-offset-[-1px] outline-n-weak rounded-lg text-n-slate-12 text-base ltr:pr-10 rtl:pl-10 font-normal ltr:bg-[right_-1.6rem_center] rtl:bg-[left_-1.6rem_center] focus:outline-n-brand focus:ring-1 focus:ring-n-brand;
++  @apply bg-n-surface-2 dark:bg-n-solid-2 w-full p-2.5 border-none outline outline-1 outline-offset-[-1px] outline-n-weak rounded-lg text-n-slate-12 text-base ltr:pr-10 rtl:pl-10 font-normal ltr:bg-[right_-1.6rem_center] rtl:bg-[left_-1.6rem_center] focus:outline-n-brand focus:ring-1 focus:ring-n-brand;
+ 
+   -moz-appearance: none;
+   -webkit-appearance: none;
+@@ -139,6 +139,12 @@ blockquote {
+   @apply ltr:border-l-4 rtl:border-r-4 border-n-slate-3 dark:border-n-alpha-2 border-solid my-1 px-0 text-n-slate-11 py-1 ltr:pr-2 rtl:pr-4 ltr:pl-4 rtl:pl-2;
+ }
+ 
++@layer components {
++  .surface-card {
++    @apply rounded-xl bg-n-solid-1 dark:bg-n-solid-2 outline outline-1 outline-n-weak dark:outline-n-strong shadow-[0_1px_2px_rgba(0,0,0,0.04)] dark:shadow-none;
++  }
++}
++
+ .button {
+   @apply appearance-none bg-n-brand border border-solid border-n-brand text-white cursor-pointer inline-block text-sm h-10 leading-none outline-none outline-0 py-1 px-4 text-center no-underline select-none align-middle whitespace-nowrap;
+ 
+@@ -187,7 +193,6 @@ blockquote {
+ @layer base {
+   // NEXT COLORS START
+   :root {
+-    // slate
+     --slate-1: 252 252 253;
+     --slate-2: 249 249 251;
+     --slate-3: 240 240 243;
+@@ -200,22 +205,18 @@ blockquote {
+     --slate-10: 128 131 141;
+     --slate-11: 96 100 108;
+     --slate-12: 28 32 36;
+-
+-    // iris
+-    --iris-1: 253 253 255;
+-    --iris-2: 248 248 255;
+-    --iris-3: 240 241 254;
+-    --iris-4: 230 231 255;
+-    --iris-5: 218 220 255;
+-    --iris-6: 203 205 255;
+-    --iris-7: 184 186 248;
+-    --iris-8: 155 158 240;
+-    --iris-9: 91 91 214;
+-    --iris-10: 81 81 205;
+-    --iris-11: 87 83 198;
+-    --iris-12: 39 41 98;
+-
+-    // ruby
++    --blue-1: 251 253 255;
++    --blue-2: 245 249 255;
++    --blue-3: 233 243 255;
++    --blue-4: 218 236 255;
++    --blue-5: 201 226 255;
++    --blue-6: 181 213 255;
++    --blue-7: 155 195 252;
++    --blue-8: 117 171 247;
++    --blue-9: 39 129 246;
++    --blue-10: 16 115 233;
++    --blue-11: 8 109 224;
++    --blue-12: 11 50 101;
+     --ruby-1: 255 252 253;
+     --ruby-2: 255 247 248;
+     --ruby-3: 254 234 237;
+@@ -228,8 +229,6 @@ blockquote {
+     --ruby-10: 220 59 93;
+     --ruby-11: 202 36 77;
+     --ruby-12: 100 23 43;
+-
+-    // amber
+     --amber-1: 254 253 251;
+     --amber-2: 254 251 233;
+     --amber-3: 255 247 194;
+@@ -242,8 +241,6 @@ blockquote {
+     --amber-10: 255 186 24;
+     --amber-11: 171 100 0;
+     --amber-12: 79 52 34;
+-
+-    // teal
+     --teal-1: 250 254 253;
+     --teal-2: 243 251 249;
+     --teal-3: 224 248 243;
+@@ -256,8 +253,6 @@ blockquote {
+     --teal-10: 13 155 138;
+     --teal-11: 0 133 115;
+     --teal-12: 13 61 56;
+-
+-    // gray
+     --gray-1: 252 252 252;
+     --gray-2: 249 249 249;
+     --gray-3: 240 240 240;
+@@ -270,34 +265,25 @@ blockquote {
+     --gray-10: 131 131 131;
+     --gray-11: 100 100 100;
+     --gray-12: 32 32 32;
+-
+     --background-color: 253 253 253;
+-    --surface-1: 254 254 254;
++    --surface-1: 253 253 253;
+     --surface-2: 255 255 255;
+     --surface-active: 255 255 255;
+-    --text-blue: 8 109 224;
+     --border-container: 236 236 236;
+-    --border-strong: 235 235 235;
+-    --border-weak: 234 234 234;
++    --border-strong: 226 227 231;
++    --border-weak: 240 240 240;
+     --solid-1: 255 255 255;
+     --solid-2: 255 255 255;
+     --solid-3: 255 255 255;
+     --solid-active: 255 255 255;
+-    --solid-amber: 252 232 193;
+-    --solid-blue: 218 236 255;
+-    --solid-iris: 230 231 255;
+-
+-    --alpha-1: 67, 67, 67, 0.06;
+-    --alpha-2: 201, 202, 207, 0.15;
++    --alpha-1: 215, 215, 215, 0.22;
++    --alpha-2: 196, 197, 198, 0.22;
+     --alpha-3: 255, 255, 255, 0.96;
+     --black-alpha-1: 0, 0, 0, 0.12;
+     --black-alpha-2: 0, 0, 0, 0.04;
+-    --border-blue: 39, 129, 246, 0.5;
+-    --white-alpha: 255, 255, 255, 0.8;
+   }
+ 
+   .dark {
+-    // slate
+     --slate-1: 17 17 19;
+     --slate-2: 24 25 27;
+     --slate-3: 33 34 37;
+@@ -310,22 +296,18 @@ blockquote {
+     --slate-10: 119 123 132;
+     --slate-11: 176 180 186;
+     --slate-12: 237 238 240;
+-
+-    // iris
+-    --iris-1: 19 19 30;
+-    --iris-2: 23 22 37;
+-    --iris-3: 32 34 72;
+-    --iris-4: 38 42 101;
+-    --iris-5: 48 51 116;
+-    --iris-6: 61 62 130;
+-    --iris-7: 74 74 149;
+-    --iris-8: 89 88 177;
+-    --iris-9: 91 91 214;
+-    --iris-10: 84 114 228;
+-    --iris-11: 158 177 255;
+-    --iris-12: 224 223 254;
+-
+-    // ruby
++    --blue-1: 10 17 28;
++    --blue-2: 15 24 38;
++    --blue-3: 15 39 72;
++    --blue-4: 10 49 99;
++    --blue-5: 18 61 117;
++    --blue-6: 29 84 134;
++    --blue-7: 40 89 156;
++    --blue-8: 48 106 186;
++    --blue-9: 39 129 246;
++    --blue-10: 21 116 231;
++    --blue-11: 126 182 255;
++    --blue-12: 205 227 255;
+     --ruby-1: 25 17 19;
+     --ruby-2: 30 21 23;
+     --ruby-3: 58 20 30;
+@@ -338,8 +320,6 @@ blockquote {
+     --ruby-10: 236 90 114;
+     --ruby-11: 255 148 157;
+     --ruby-12: 254 210 225;
+-
+-    // amber
+     --amber-1: 22 18 12;
+     --amber-2: 29 24 15;
+     --amber-3: 48 32 8;
+@@ -352,8 +332,6 @@ blockquote {
+     --amber-10: 255 214 10;
+     --amber-11: 255 202 22;
+     --amber-12: 255 231 179;
+-
+-    // teal
+     --teal-1: 13 21 20;
+     --teal-2: 17 28 27;
+     --teal-3: 13 45 42;
+@@ -366,8 +344,6 @@ blockquote {
+     --teal-10: 14 179 158;
+     --teal-11: 11 216 182;
+     --teal-12: 173 240 221;
+-
+-    // gray
+     --gray-1: 17 17 17;
+     --gray-2: 25 25 25;
+     --gray-3: 34 34 34;
+@@ -380,29 +356,21 @@ blockquote {
+     --gray-10: 123 123 123;
+     --gray-11: 180 180 180;
+     --gray-12: 238 238 238;
+-
+-    --background-color: 18 18 19;
+-    --surface-1: 20 21 23;
+-    --surface-2: 22 23 26;
++    --background-color: 13 13 13;
++    --surface-1: 13 13 13;
++    --surface-2: 24 24 24;
+     --surface-active: 53 57 66;
+-    --border-strong: 52 52 52;
+-    --border-weak: 38 38 42;
+-    --solid-1: 23 23 26;
+-    --solid-2: 29 30 36;
+-    --solid-3: 44 45 54;
++    --border-strong: 42 42 42;
++    --border-weak: 33 33 33;
++    --solid-1: 24 24 24;
++    --solid-2: 27 27 27;
++    --solid-3: 48 48 48;
+     --solid-active: 53 57 66;
+-    --solid-amber: 42 37 30;
+-    --solid-blue: 16 49 91;
+-    --solid-iris: 38 42 101;
+-    --text-blue: 126 182 255;
+-
+-    --alpha-1: 36, 36, 36, 0.8;
+-    --alpha-2: 139, 147, 182, 0.15;
+-    --alpha-3: 36, 38, 45, 0.9;
++    --alpha-1: 35, 36, 42, 0.8;
++    --alpha-2: 147, 153, 176, 0.12;
++    --alpha-3: 33, 34, 38, 0.95;
+     --black-alpha-1: 0, 0, 0, 0.3;
+     --black-alpha-2: 0, 0, 0, 0.2;
+-    --border-blue: 39, 129, 246, 0.5;
+-    --border-container: 236, 236, 236, 0;
+-    --white-alpha: 255, 255, 255, 0.1;
++    --border-container: 255, 255, 255, 0;
+   }
+ }
+diff --git a/app/javascript/widget/components/AgentMessage.vue b/app/javascript/widget/components/AgentMessage.vue
+index 43fc5be9b6372e8d0c3e2c2238784206985be354..28496639c6011af1819d88a806eb2f2aec2bd0a3 100755
+--- a/app/javascript/widget/components/AgentMessage.vue
++++ b/app/javascript/widget/components/AgentMessage.vue
+@@ -215,7 +215,7 @@ export default {
+             />
+             <div
+               v-if="hasAttachments"
+-              class="space-y-2 chat-bubble has-attachment agent bg-n-background dark:bg-n-solid-3"
++              class="space-y-2 chat-bubble has-attachment agent bg-n-solid-1 dark:bg-n-solid-3"
+               :class="wrapClass"
+             >
+               <div
+diff --git a/app/javascript/widget/components/AgentMessageBubble.vue b/app/javascript/widget/components/AgentMessageBubble.vue
+index 5afc21415561b2d6abc04b1d8000b78a5ddfa0bb..fa60469795f55972083924e25aecd10bfa379898 100755
+--- a/app/javascript/widget/components/AgentMessageBubble.vue
++++ b/app/javascript/widget/components/AgentMessageBubble.vue
+@@ -112,7 +112,7 @@ export default {
+       v-if="
+         !isCards && !isOptions && !isForm && !isArticle && !isCards && !isCSAT
+       "
+-      class="chat-bubble agent bg-n-background dark:bg-n-solid-3 text-n-slate-12"
++      class="chat-bubble agent bg-n-solid-1 dark:bg-n-solid-3 text-n-slate-12"
+     >
+       <TranslatingContent :translating="translating" :translated="hasOriginal">
+         <div
+diff --git a/app/javascript/widget/components/AgentTypingBubble.vue b/app/javascript/widget/components/AgentTypingBubble.vue
+index e90bee7c8b30e5ad1ece5eec3b0e1c539cd26ddd..1fb8f3420b4896976f94752bdc22e25df963be92 100644
+--- a/app/javascript/widget/components/AgentTypingBubble.vue
++++ b/app/javascript/widget/components/AgentTypingBubble.vue
+@@ -10,7 +10,7 @@ export default {
+       <div class="avatar-wrap" />
+       <div class="message-wrap mt-2">
+         <div
+-          class="chat-bubble agent typing-bubble bg-n-background dark:bg-n-solid-3"
++          class="chat-bubble agent typing-bubble bg-n-solid-1 dark:bg-n-solid-3"
+         >
+           <img
+             src="assets/images/typing.gif"
+diff --git a/app/javascript/widget/components/Availability/AvailabilityContainer.vue b/app/javascript/widget/components/Availability/AvailabilityContainer.vue
+index 28abfa082c7a8fe34ba8dffa91083dd7147412f0..7156e6714f3ca43b59d91a7cc2dcce6bc5cd1b81 100644
+--- a/app/javascript/widget/components/Availability/AvailabilityContainer.vue
++++ b/app/javascript/widget/components/Availability/AvailabilityContainer.vue
+@@ -80,7 +80,7 @@ const headerText = computed(() =>
+         :is-online="isOnline"
+         :is-in-working-hours="isInWorkingHours"
+         :class="textClasses"
+-        class="text-n-slate-11"
++        class="text-n-slate-12"
+       />
+     </div>
+ 
+diff --git a/app/javascript/widget/components/ChatFooter.vue b/app/javascript/widget/components/ChatFooter.vue
+index 2cad4d177d3b5a9b61729b7c9729c28eb66d73d0..a82b68a50b6f4ef7f4f5e98e2c6d8425f15b5c6a 100755
+--- a/app/javascript/widget/components/ChatFooter.vue
++++ b/app/javascript/widget/components/ChatFooter.vue
+@@ -7,7 +7,7 @@ import ChatInputWrap from 'widget/components/ChatInputWrap.vue';
+ import { BUS_EVENTS } from 'shared/constants/busEvents';
+ import { sendEmailTranscript } from 'widget/api/conversation';
+ import { useRouter } from 'vue-router';
+-import { IFrameHelper } from '../helpers/utils';
++import { IFrameHelper, isMultipleConversationsEnabled } from '../helpers/utils';
+ import { CHATWOOT_ON_START_CONVERSATION } from '../constants/sdkEvents';
+ import { emitter } from 'shared/helpers/mitt';
+ 
+@@ -87,7 +87,10 @@ export default {
+       });
+       this.inReplyTo = null;
+     },
+-    startNewConversation() {
++    async startNewConversation() {
++      if (isMultipleConversationsEnabled()) {
++        await this.$store.dispatch('conversationList/startNew');
++      }
+       this.router.replace({ name: 'prechat-form' });
+       IFrameHelper.sendMessage({
+         event: 'onEvent',
+diff --git a/app/javascript/widget/components/ChatHeader.vue b/app/javascript/widget/components/ChatHeader.vue
+index 00b8bf99698d68e314fd5bf023f987d4475db8a3..d5b91cb2bdaaa4d9768d707a33b943b9b5ee42c8 100644
+--- a/app/javascript/widget/components/ChatHeader.vue
++++ b/app/javascript/widget/components/ChatHeader.vue
+@@ -11,6 +11,7 @@ const props = defineProps({
+   title: { type: String, default: '' },
+   showPopoutButton: { type: Boolean, default: false },
+   showBackButton: { type: Boolean, default: false },
++  backRouteName: { type: String, default: 'home' },
+   availableAgents: { type: Array, default: () => [] },
+ });
+ 
+@@ -20,16 +21,19 @@ const router = useRouter();
+ const { isOnline } = useAvailability(availableAgents);
+ 
+ const onBackButtonClick = () => {
+-  router.replace({ name: 'home' });
++  router.replace({ name: props.backRouteName });
+ };
+ </script>
+ 
+ <template>
+-  <header class="flex justify-between w-full p-5 bg-n-background gap-2">
++  <header
++    class="flex justify-between w-full p-5 gap-2 bg-n-solid-1 border-b border-n-weak dark:border-n-strong"
++  >
+     <div class="flex items-center">
+       <button
+         v-if="showBackButton"
+         class="px-2 ltr:-ml-3 rtl:-mr-3"
++        :aria-label="$t('BACK')"
+         @click="onBackButtonClick"
+       >
+         <FluentIcon
+diff --git a/app/javascript/widget/components/ChatHeaderExpanded.vue b/app/javascript/widget/components/ChatHeaderExpanded.vue
+index e89b1aef08ce6b16904a846ba2b4c4495085d90d..2f493d5862ba29811cef5d4e3709eb81ac36eabc 100755
+--- a/app/javascript/widget/components/ChatHeaderExpanded.vue
++++ b/app/javascript/widget/components/ChatHeaderExpanded.vue
+@@ -30,9 +30,7 @@ const containerClasses = computed(() => [
+ </script>
+ 
+ <template>
+-  <header
+-    class="header-expanded pt-6 pb-4 px-5 relative box-border w-full bg-transparent"
+-  >
++  <header class="header-expanded pt-6 pb-5 px-5 relative box-border w-full">
+     <div class="flex items-start" :class="containerClasses">
+       <img
+         v-if="avatarUrl"
+@@ -47,11 +45,11 @@ const containerClasses = computed(() => [
+     </div>
+     <h2
+       v-dompurify-html="introHeading"
+-      class="mt-4 text-2xl mb-1.5 font-medium text-n-slate-12 line-clamp-4"
++      class="mt-5 text-[1.75rem] leading-tight tracking-tight mb-2 font-semibold text-n-slate-12 line-clamp-4"
+     />
+     <p
+       v-dompurify-html="formatMessage(introBody)"
+-      class="text-lg leading-normal text-n-slate-11 [&_a]:underline line-clamp-6"
++      class="text-base leading-relaxed text-n-slate-12 [&_a]:underline line-clamp-6"
+     />
+   </header>
+ </template>
+diff --git a/app/javascript/widget/components/ChatInputWrap.vue b/app/javascript/widget/components/ChatInputWrap.vue
+index b95a8c9903f522814bad1e3a3255d4c6892029cc..24df24e4ceab2032f6e262ab89560ac5a6914b9c 100755
+--- a/app/javascript/widget/components/ChatInputWrap.vue
++++ b/app/javascript/widget/components/ChatInputWrap.vue
+@@ -134,7 +134,7 @@ export default {
+ 
+ <template>
+   <div
+-    class="items-center flex ltr:pl-3 rtl:pr-3 ltr:pr-2 rtl:pl-2 rounded-[7px] transition-all duration-200 bg-n-background !shadow-[0_0_0_1px,0_0_2px_3px]"
++    class="items-center flex ltr:pl-3 rtl:pr-3 ltr:pr-2 rtl:pl-2 rounded-lg transition-all duration-200 bg-n-solid-1 dark:bg-n-solid-2 !shadow-[0_0_0_1px,0_0_2px_3px]"
+     :class="{
+       '!shadow-[var(--widget-color,#2781f6)]': isFocused,
+       '!shadow-n-strong dark:!shadow-n-strong': !isFocused,
+@@ -193,6 +193,6 @@ export default {
+ 
+ <style scoped lang="scss">
+ .user-message-input {
+-  @apply border-none outline-none w-full placeholder:text-n-slate-10 resize-none h-8 min-h-8 max-h-60 py-1 px-0 my-2 bg-n-background text-n-slate-12 transition-all duration-200;
++  @apply border-none outline-none w-full placeholder:text-n-slate-10 resize-none h-8 min-h-8 max-h-60 py-1 px-0 my-2 bg-transparent text-n-slate-12 transition-all duration-200;
+ }
+ </style>
+diff --git a/app/javascript/widget/components/ConversationListItem.vue b/app/javascript/widget/components/ConversationListItem.vue
+new file mode 100644
+index 0000000000000000000000000000000000000000..37f0ed2f1549374a0bd7fa16b23c66d27983d108
+--- /dev/null
++++ b/app/javascript/widget/components/ConversationListItem.vue
+@@ -0,0 +1,115 @@
++<script setup>
++import { computed } from 'vue';
++import { useI18n } from 'vue-i18n';
++import { getContrastingTextColor } from '@chatwoot/utils';
++import { useMapGetter } from 'dashboard/composables/store.js';
++import { useMessageFormatter } from 'shared/composables/useMessageFormatter';
++import Avatar from 'dashboard/components-next/avatar/Avatar.vue';
++import { relativeDayTimestamp } from 'shared/helpers/timeHelper';
++import { MESSAGE_TYPE } from 'widget/helpers/constants';
++
++const props = defineProps({
++  conversation: { type: Object, required: true },
++});
++
++defineEmits(['select']);
++
++const { t } = useI18n();
++const { getPlainText } = useMessageFormatter();
++const widgetColor = useMapGetter('appConfig/getWidgetColor');
++
++const channelConfig = window.chatwootWebChannel;
++const useInboxAvatarForBot = channelConfig.enabledFeatures.includes(
++  'use_inbox_avatar_for_bot'
++);
++const botAvatarUrl = useInboxAvatarForBot
++  ? channelConfig.avatarUrl
++  : '/assets/images/chatwoot_bot.png';
++
++const isResolved = computed(() => props.conversation.status === 'resolved');
++const unreadCount = computed(() => props.conversation.unread_count);
++const lastMessage = computed(() => props.conversation.last_message);
++const isVisitorMessage = computed(
++  () => lastMessage.value?.message_type === MESSAGE_TYPE.INCOMING
++);
++
++// Same identity rules as the agent bubbles on the messages screen.
++const senderName = computed(() => {
++  const { sender } = lastMessage.value || {};
++  if (sender) return sender.available_name || sender.name;
++  return useInboxAvatarForBot
++    ? channelConfig.websiteName
++    : t('UNREAD_VIEW.BOT');
++});
++const senderAvatarUrl = computed(() => {
++  const message = lastMessage.value || {};
++  if (message.message_type === MESSAGE_TYPE.TEMPLATE) return botAvatarUrl;
++  return message.sender?.avatar_url || botAvatarUrl;
++});
++
++const preview = computed(() => {
++  const message = lastMessage.value;
++  if (!message) return '';
++  const content = message.content
++    ? getPlainText(message.content)
++    : t('CONVERSATIONS.ATTACHMENT');
++  return isVisitorMessage.value ? `${t('YOU')}: ${content}` : content;
++});
++
++const timestamp = computed(() =>
++  relativeDayTimestamp(props.conversation.last_activity_at, t('YESTERDAY'))
++);
++</script>
++
++<template>
++  <button
++    type="button"
++    class="flex flex-col w-full gap-0.5 outline-none text-start focus-visible:bg-n-alpha-2"
++    @click="$emit('select', conversation.id)"
++  >
++    <span class="flex items-center w-full gap-3">
++      <span class="flex items-center flex-1 min-w-0 gap-2">
++        <span class="shrink-0 text-sm font-medium leading-5 text-n-slate-12">
++          {{ `#${conversation.id}` }}
++        </span>
++        <span
++          v-if="isResolved"
++          class="inline-flex items-center gap-0.5 px-1.5 rounded-full shrink-0 text-xxs font-medium leading-4 bg-n-teal-3 text-n-teal-11"
++        >
++          <i class="i-lucide-check size-2.5" aria-hidden="true" />
++          {{ $t('CONVERSATIONS.RESOLVED') }}
++        </span>
++      </span>
++      <span class="text-sm leading-5 shrink-0 text-n-slate-11">
++        {{ timestamp }}
++      </span>
++    </span>
++    <span class="flex items-center w-full gap-2">
++      <span class="flex-1 min-w-0 text-sm leading-5 truncate text-n-slate-12">
++        {{ preview }}
++      </span>
++      <span class="flex items-center h-5 gap-1.5 shrink-0">
++        <span
++          v-if="unreadCount"
++          class="flex items-center justify-center h-5 px-1.5 text-xs font-semibold rounded-full min-w-5"
++          :style="{
++            backgroundColor: widgetColor,
++            color: getContrastingTextColor(widgetColor),
++          }"
++        >
++          <span aria-hidden="true">{{ unreadCount }}</span>
++          <span class="sr-only">
++            {{ $t('CONVERSATIONS.UNREAD_COUNT', unreadCount) }}
++          </span>
++        </span>
++        <Avatar
++          v-if="lastMessage && !isVisitorMessage"
++          :src="senderAvatarUrl"
++          :name="senderName"
++          :size="20"
++          rounded-full
++        />
++      </span>
++    </span>
++  </button>
++</template>
+diff --git a/app/javascript/widget/components/Form/PhoneInput.vue b/app/javascript/widget/components/Form/PhoneInput.vue
+index c89abd70d56802096c9ac3954a52941f888c4279..16f69093169a265ccaf79a4c043aa98d1e2b291e 100644
+--- a/app/javascript/widget/components/Form/PhoneInput.vue
++++ b/app/javascript/widget/components/Form/PhoneInput.vue
+@@ -166,7 +166,7 @@ function onSelect() {
+ <template>
+   <div class="relative mt-2 phone-input--wrap">
+     <div
+-      class="flex items-center justify-start outline-none phone-input rounded-lg box-border bg-n-background dark:bg-n-alpha-2 border-none outline outline-1 outline-offset-[-1px] text-sm w-full text-n-slate-12 focus-within:outline-n-brand focus-within:ring-1 focus-within:ring-n-brand"
++      class="flex items-center justify-start outline-none phone-input rounded-lg box-border bg-n-surface-2 dark:bg-n-alpha-2 border-none outline outline-1 outline-offset-[-1px] text-sm w-full text-n-slate-12 focus-within:outline-n-brand focus-within:ring-1 focus-within:ring-n-brand"
+       :class="{
+         'outline-n-ruby-8 dark:outline-n-ruby-8 hover:outline-n-ruby-9 dark:hover:outline-n-ruby-9':
+           hasErrorInPhoneInput,
+@@ -203,14 +203,12 @@ function onSelect() {
+       v-if="showDropdown"
+       ref="dropdownRef"
+       v-on-clickaway="closeDropdown"
+-      class="country-dropdown absolute bg-n-background text-n-slate-12 dark:bg-n-solid-3 z-10 h-48 px-0 pt-0 pb-1 pl-1 pr-1 overflow-y-auto rounded-lg shadow-lg top-12 w-full min-w-24 max-w-[14.8rem]"
++      class="country-dropdown absolute bg-n-solid-1 text-n-slate-12 dark:bg-n-solid-3 z-10 h-48 px-0 pt-0 pb-1 pl-1 pr-1 overflow-y-auto rounded-lg shadow-lg top-12 w-full min-w-24 max-w-[14.8rem]"
+       @keydown.up="moveSelectionUp"
+       @keydown.down="moveSelectionDown"
+       @keydown.enter="onSelect"
+     >
+-      <div
+-        class="sticky top-0 bg-n-background text-n-slate-12 dark:bg-n-solid-3"
+-      >
++      <div class="sticky top-0 bg-n-solid-1 text-n-slate-12 dark:bg-n-solid-3">
+         <input
+           ref="searchbarRef"
+           v-model="searchCountry"
+diff --git a/app/javascript/widget/components/TabBar.vue b/app/javascript/widget/components/TabBar.vue
+new file mode 100644
+index 0000000000000000000000000000000000000000..abddd104c8cb15b5409e9352d5d42209f740f1c4
+--- /dev/null
++++ b/app/javascript/widget/components/TabBar.vue
+@@ -0,0 +1,78 @@
++<script setup>
++import { computed } from 'vue';
++import { useI18n } from 'vue-i18n';
++import { useRoute, useRouter } from 'vue-router';
++import { getContrastingTextColor } from '@chatwoot/utils';
++import { useMapGetter } from 'dashboard/composables/store.js';
++
++const MESSAGE_ROUTES = ['conversations', 'messages', 'prechat-form'];
++
++const { t } = useI18n();
++const route = useRoute();
++const router = useRouter();
++
++const widgetColor = useMapGetter('appConfig/getWidgetColor');
++const activeUnreadCount = useMapGetter('conversation/getUnreadMessageCount');
++const otherUnreadCount = useMapGetter('conversationList/getUnreadCount');
++
++const unreadCount = computed(
++  () => otherUnreadCount.value + (activeUnreadCount.value > 0 ? 1 : 0)
++);
++const activeTab = computed(() =>
++  MESSAGE_ROUTES.includes(route.name) ? 'conversations' : 'home'
++);
++
++const tabs = computed(() => [
++  {
++    name: 'home',
++    icon: 'i-ph-house',
++    label: t('TABS.HOME'),
++  },
++  {
++    name: 'conversations',
++    icon: 'i-ph-chats',
++    label: t('TABS.MESSAGES'),
++    count: unreadCount.value,
++  },
++]);
++</script>
++
++<template>
++  <nav
++    class="absolute inset-x-0 bottom-0 z-50 flex h-16 bg-n-surface-1 border-t border-solid border-n-weak shadow-[0_-8px_24px_-12px_rgba(0,0,0,0.12)] dark:shadow-[0_-8px_24px_-12px_rgba(0,0,0,0.6)]"
++  >
++    <button
++      v-for="tab in tabs"
++      :key="tab.name"
++      type="button"
++      class="flex items-center justify-center flex-1 outline-none focus-visible:bg-n-alpha-2"
++      :class="activeTab === tab.name ? '' : 'text-n-slate-11'"
++      :style="activeTab === tab.name ? { color: widgetColor } : {}"
++      :aria-label="tab.label"
++      :aria-current="activeTab === tab.name ? 'page' : null"
++      @click="router.replace({ name: tab.name })"
++    >
++      <span class="relative flex items-center">
++        <i :class="tab.icon" class="size-6" aria-hidden="true" />
++        <span
++          v-if="tab.count"
++          class="absolute flex items-center justify-center h-4 px-1 rounded-full -top-1.5 start-3.5 min-w-4 text-xxs font-semibold leading-4"
++          :class="{ 'bg-n-slate-12 text-n-slate-1': activeTab !== tab.name }"
++          :style="
++            activeTab === tab.name
++              ? {
++                  backgroundColor: widgetColor,
++                  color: getContrastingTextColor(widgetColor),
++                }
++              : {}
++          "
++        >
++          <span aria-hidden="true">{{ tab.count }}</span>
++          <span class="sr-only">
++            {{ $t('TABS.UNREAD_CONVERSATIONS', tab.count) }}
++          </span>
++        </span>
++      </span>
++    </button>
++  </nav>
++</template>
+diff --git a/app/javascript/widget/components/TeamAvailability.vue b/app/javascript/widget/components/TeamAvailability.vue
+index e37027a64995e1552f050c8b8cce6ffb60a25c7f..313c7d6d8f0084947c39e179e7dc2c5824854661 100644
+--- a/app/javascript/widget/components/TeamAvailability.vue
++++ b/app/javascript/widget/components/TeamAvailability.vue
+@@ -26,14 +26,16 @@ const startConversation = () => {
+ </script>
+ 
+ <template>
+-  <div
+-    class="flex flex-col gap-3 w-full shadow outline-1 outline outline-n-container rounded-xl bg-n-background dark:bg-n-solid-2 px-5 py-4"
+-  >
+-    <AvailabilityContainer :agents="availableAgents" show-header show-avatars />
+-
++  <div class="w-full surface-card divide-y divide-n-weak dark:divide-n-strong">
++    <div class="px-4 py-3">
++      <AvailabilityContainer
++        :agents="availableAgents"
++        show-header
++        show-avatars
++      />
++    </div>
+     <button
+-      class="inline-flex items-center gap-1 font-medium text-n-slate-12"
+-      :style="{ color: widgetColor }"
++      class="flex items-center justify-between w-full gap-2 px-4 py-3 text-base font-medium rounded-b-xl outline-none text-n-slate-12 transition-colors hover:bg-n-alpha-2 focus-visible:bg-n-alpha-2"
+       @click="startConversation"
+     >
+       <span>
+@@ -43,7 +45,11 @@ const startConversation = () => {
+             : $t('START_CONVERSATION')
+         }}
+       </span>
+-      <i class="i-lucide-chevron-right size-5 mt-px rtl:rotate-180" />
++      <i
++        class="i-lucide-arrow-right size-5 rtl:rotate-180"
++        :style="{ color: widgetColor }"
++        aria-hidden="true"
++      />
+     </button>
+   </div>
+ </template>
+diff --git a/app/javascript/widget/components/layouts/ViewWithHeader.vue b/app/javascript/widget/components/layouts/ViewWithHeader.vue
+index 70eaf783b84bd3e91a5f59156010253743b85c47..3983eb1e281d1679471964533b5db486a9783a63 100644
+--- a/app/javascript/widget/components/layouts/ViewWithHeader.vue
++++ b/app/javascript/widget/components/layouts/ViewWithHeader.vue
+@@ -3,6 +3,7 @@ import Banner from '../Banner.vue';
+ import Branding from 'shared/components/Branding.vue';
+ import ChatHeader from '../ChatHeader.vue';
+ import ChatHeaderExpanded from '../ChatHeaderExpanded.vue';
++import TabBar from '../TabBar.vue';
+ import configMixin from '../../mixins/configMixin';
+ import { mapGetters } from 'vuex';
+ import { IFrameHelper } from 'widget/helpers/utils';
+@@ -13,6 +14,7 @@ export default {
+     Branding,
+     ChatHeader,
+     ChatHeaderExpanded,
++    TabBar,
+   },
+   mixins: [configMixin],
+   data() {
+@@ -48,12 +50,21 @@ export default {
+         this.$route.name
+       );
+     },
++    backRouteName() {
++      const isOnMessages = this.$route.name === 'messages';
++      return isOnMessages && this.hasMultipleConversationsEnabled
++        ? 'conversations'
++        : 'home';
++    },
+     isOnArticleViewer() {
+       return ['article-viewer'].includes(this.$route.name);
+     },
+     isOnHomeView() {
+       return ['home'].includes(this.$route.name);
+     },
++    isOnTabScreen() {
++      return ['home', 'conversations'].includes(this.$route.name);
++    },
+     opacityClass() {
+       if (this.isHeaderCollapsed) {
+         return {};
+@@ -76,11 +87,14 @@ export default {
+       return {};
+     },
+   },
+-  mounted() {
+-    this.$el.addEventListener('scroll', this.updateScrollPosition);
++  watch: {
++    '$route.name'() {
++      this.scrollPosition = 0;
++      this.$el.scrollTop = 0;
++      this.$refs.content.scrollTop = 0;
++    },
+   },
+   unmounted() {
+-    this.$el.removeEventListener('scroll', this.updateScrollPosition);
+     cancelAnimationFrame(this.requestID);
+   },
+   methods: {
+@@ -88,6 +102,7 @@ export default {
+       IFrameHelper.sendMessage({ event: 'closeWindow' });
+     },
+     updateScrollPosition(event) {
++      if (!this.isOnHomeView) return;
+       this.scrollPosition = event.target.scrollTop;
+       if (!this.ticking) {
+         this.requestID = window.requestAnimationFrame(() => {
+@@ -103,42 +118,64 @@ export default {
+ 
+ <template>
+   <div
+-    class="w-full h-full bg-n-slate-2 dark:bg-n-solid-1"
+-    :class="{ 'overflow-auto': isOnHomeView }"
++    class="w-full h-full bg-n-surface-1"
++    :class="{
++      'overflow-auto': isOnHomeView && !hasMultipleConversationsEnabled,
++    }"
+     @keydown.esc="closeWindow"
++    @scroll.capture="updateScrollPosition"
+   >
+     <div class="relative flex flex-col h-full">
+       <div
+-        :class="{
+-          expanded: !isHeaderCollapsed,
+-          collapsed: isHeaderCollapsed,
+-          'shadow-[0_10px_15px_-16px_rgba(50,50,93,0.08),0_4px_6px_-8px_rgba(50,50,93,0.04)]':
+-            isHeaderCollapsed,
+-          ...opacityClass,
+-        }"
++        ref="content"
++        :class="
++          hasMultipleConversationsEnabled
++            ? [
++                'relative flex flex-col flex-1 min-h-0',
++                { 'overflow-auto pb-24': isOnHomeView },
++              ]
++            : 'contents'
++        "
+       >
+-        <ChatHeaderExpanded
+-          v-if="!isHeaderCollapsed"
+-          :intro-heading="appConfig.welcomeTitle || channelConfig.welcomeTitle"
+-          :intro-body="
+-            appConfig.welcomeDescription || channelConfig.welcomeTagline
+-          "
+-          :avatar-url="channelConfig.avatarUrl"
+-          :show-popout-button="appConfig.showPopoutButton"
+-        />
+-        <ChatHeader
+-          v-if="isHeaderCollapsed"
+-          :title="channelConfig.websiteName"
+-          :avatar-url="channelConfig.avatarUrl"
+-          :show-popout-button="appConfig.showPopoutButton"
+-          :available-agents="availableAgents"
+-          :show-back-button="showBackButton"
++        <div
++          :class="{
++            expanded: !isHeaderCollapsed,
++            'collapsed relative z-10': isHeaderCollapsed,
++            'shadow-[0_10px_15px_-16px_rgba(50,50,93,0.08),0_4px_6px_-8px_rgba(50,50,93,0.04)]':
++              isHeaderCollapsed,
++            ...opacityClass,
++          }"
++        >
++          <ChatHeaderExpanded
++            v-if="!isHeaderCollapsed"
++            :intro-heading="
++              appConfig.welcomeTitle || channelConfig.welcomeTitle
++            "
++            :intro-body="
++              appConfig.welcomeDescription || channelConfig.welcomeTagline
++            "
++            :avatar-url="channelConfig.avatarUrl"
++            :show-popout-button="appConfig.showPopoutButton"
++          />
++          <ChatHeader
++            v-if="isHeaderCollapsed"
++            :title="channelConfig.websiteName"
++            :avatar-url="channelConfig.avatarUrl"
++            :show-popout-button="appConfig.showPopoutButton"
++            :available-agents="availableAgents"
++            :show-back-button="showBackButton"
++            :back-route-name="backRouteName"
++          />
++        </div>
++        <Banner />
++        <router-view />
++
++        <Branding
++          v-if="!isOnArticleViewer"
++          :disable-branding="disableBranding"
+         />
+       </div>
+-      <Banner />
+-      <router-view />
+-
+-      <Branding v-if="!isOnArticleViewer" :disable-branding="disableBranding" />
++      <TabBar v-if="hasMultipleConversationsEnabled && isOnTabScreen" />
+     </div>
+   </div>
+ </template>
+diff --git a/app/javascript/widget/components/pageComponents/Home/Article/ArticleBlock.vue b/app/javascript/widget/components/pageComponents/Home/Article/ArticleBlock.vue
+index 7f4f8df7dee86e4c58d502ac72f2317401a601cf..eb11e2d47a8f54d948b38dcfbc3642c3f0a45670 100644
+--- a/app/javascript/widget/components/pageComponents/Home/Article/ArticleBlock.vue
++++ b/app/javascript/widget/components/pageComponents/Home/Article/ArticleBlock.vue
+@@ -22,11 +22,20 @@ const onArticleClick = link => {
+ </script>
+ 
+ <template>
+-  <div class="flex flex-col gap-3">
+-    <h3 class="font-medium text-n-slate-12">
+-      {{ $t('PORTAL.POPULAR_ARTICLES') }}
+-    </h3>
+-    <div class="flex flex-col gap-4">
++  <div class="divide-y divide-n-weak dark:divide-n-strong">
++    <div class="flex items-center justify-between gap-2 px-4 py-3">
++      <h3 class="font-medium text-n-slate-12">
++        {{ $t('PORTAL.POPULAR_ARTICLES') }}
++      </h3>
++      <button
++        class="text-sm font-medium shrink-0"
++        :style="{ color: widgetColor }"
++        @click="$emit('viewAll')"
++      >
++        {{ $t('PORTAL.VIEW_ALL_ARTICLES') }}
++      </button>
++    </div>
++    <div class="flex flex-col px-2 py-1">
+       <ArticleListItem
+         v-for="article in articlesToDisplay"
+         :key="article.slug"
+@@ -35,14 +44,5 @@ const onArticleClick = link => {
+         @select-article="onArticleClick"
+       />
+     </div>
+-    <div>
+-      <button
+-        class="font-medium tracking-wide inline-flex"
+-        :style="{ color: widgetColor }"
+-        @click="$emit('viewAll')"
+-      >
+-        <span>{{ $t('PORTAL.VIEW_ALL_ARTICLES') }}</span>
+-      </button>
+-    </div>
+   </div>
+ </template>
+diff --git a/app/javascript/widget/components/pageComponents/Home/Article/ArticleContainer.vue b/app/javascript/widget/components/pageComponents/Home/Article/ArticleContainer.vue
+index 6cfaf8fac360089045ba74dd36944a2bc4eb99ef..530ccf5efe4af3eb15e30ce60e0e93709874e503 100644
+--- a/app/javascript/widget/components/pageComponents/Home/Article/ArticleContainer.vue
++++ b/app/javascript/widget/components/pageComponents/Home/Article/ArticleContainer.vue
+@@ -77,7 +77,7 @@ onMounted(() => fetchArticles());
+ <template>
+   <div
+     v-if="portal && (articleUiFlags.isFetching || !!popularArticles.length)"
+-    class="w-full shadow outline-1 outline outline-n-container rounded-xl bg-n-background dark:bg-n-solid-2 px-5 py-4"
++    class="w-full surface-card"
+   >
+     <ArticleBlock
+       v-if="hasArticles"
+@@ -85,7 +85,7 @@ onMounted(() => fetchArticles());
+       @view="openArticleInArticleViewer"
+       @view-all="viewAllArticles"
+     />
+-    <ArticleCardSkeletonLoader v-if="articleUiFlags.isFetching" />
++    <ArticleCardSkeletonLoader v-if="articleUiFlags.isFetching" class="p-4" />
+   </div>
+   <div v-else class="hidden" />
+ </template>
+diff --git a/app/javascript/widget/components/pageComponents/Home/Article/ArticleListItem.vue b/app/javascript/widget/components/pageComponents/Home/Article/ArticleListItem.vue
+index c34b972ad8fb4cccdd8cbfbc1de7e3abe399b3a1..d22051542acf33bc0c746d610905b21f1a903962 100644
+--- a/app/javascript/widget/components/pageComponents/Home/Article/ArticleListItem.vue
++++ b/app/javascript/widget/components/pageComponents/Home/Article/ArticleListItem.vue
+@@ -17,7 +17,7 @@ const onClick = () => {
+ 
+ <template>
+   <div
+-    class="flex items-center justify-between rounded cursor-pointer text-n-slate-11 hover:text-n-slate-12 gap-2"
++    class="flex items-center justify-between gap-2 px-2 py-2 rounded-lg cursor-pointer text-n-slate-12 transition-colors hover:bg-n-alpha-2"
+     role="button"
+     @click="onClick"
+   >
+diff --git a/app/javascript/widget/components/specs/ConversationListItem.spec.js b/app/javascript/widget/components/specs/ConversationListItem.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..0bd2bf00c156358727dc0eb23234a9929a1351c3
+--- /dev/null
++++ b/app/javascript/widget/components/specs/ConversationListItem.spec.js
+@@ -0,0 +1,119 @@
++import { mount } from '@vue/test-utils';
++import { createStore } from 'vuex';
++import ConversationListItem from '../ConversationListItem.vue';
++import Avatar from 'dashboard/components-next/avatar/Avatar.vue';
++
++const store = createStore({
++  modules: {
++    appConfig: {
++      namespaced: true,
++      getters: { getWidgetColor: () => '#1f93ff' },
++    },
++  },
++});
++
++const conversation = {
++  id: 7,
++  status: 'open',
++  unread_count: 0,
++  last_activity_at: Math.floor(Date.now() / 1000),
++  last_message: {
++    content: 'Sure, sending it now',
++    message_type: 1,
++    sender: { available_name: 'Jane Agent', avatar_url: '/jane.png' },
++  },
++};
++
++const mountItem = props =>
++  mount(ConversationListItem, {
++    props: { conversation, ...props },
++    global: { plugins: [store], stubs: { Avatar: true } },
++  });
++
++describe('ConversationListItem', () => {
++  beforeEach(() => {
++    window.chatwootWebChannel = {
++      websiteName: 'Acme',
++      avatarUrl: '/inbox.png',
++      enabledFeatures: [],
++    };
++  });
++
++  afterEach(() => {
++    delete window.chatwootWebChannel;
++  });
++
++  it('titles the row with the conversation number and shows the last agent as the sender', () => {
++    const wrapper = mountItem();
++    expect(wrapper.text()).toContain('#7');
++    expect(wrapper.text()).toContain('Sure, sending it now');
++    expect(wrapper.findComponent(Avatar).props()).toMatchObject({
++      src: '/jane.png',
++      name: 'Jane Agent',
++    });
++    expect(wrapper.find('.sr-only').exists()).toBe(false);
++  });
++
++  it('uses the bot identity for template messages', () => {
++    const wrapper = mountItem({
++      conversation: {
++        ...conversation,
++        last_message: { content: 'Rate your conversation', message_type: 3 },
++      },
++    });
++    expect(wrapper.findComponent(Avatar).props()).toMatchObject({
++      src: '/assets/images/chatwoot_bot.png',
++      name: 'UNREAD_VIEW.BOT',
++    });
++  });
++
++  it('uses the inbox identity for bots when the inbox avatar is enabled for them', () => {
++    window.chatwootWebChannel.enabledFeatures = ['use_inbox_avatar_for_bot'];
++    const wrapper = mountItem({
++      conversation: {
++        ...conversation,
++        last_message: { content: 'Hi there', message_type: 1 },
++      },
++    });
++    expect(wrapper.findComponent(Avatar).props()).toMatchObject({
++      src: '/inbox.png',
++      name: 'Acme',
++    });
++  });
++
++  it('shows no sender avatar and prefixes the preview for visitor messages', () => {
++    const wrapper = mountItem({
++      conversation: {
++        ...conversation,
++        last_message: {
++          content: 'Is it [shipped](https://a.b)?',
++          message_type: 0,
++        },
++      },
++    });
++    expect(wrapper.findComponent(Avatar).exists()).toBe(false);
++    expect(wrapper.text()).toContain('YOU: Is it shipped?');
++  });
++
++  it('announces unread messages to assistive technology', () => {
++    const wrapper = mountItem({
++      conversation: { ...conversation, unread_count: 3 },
++    });
++    expect(wrapper.find('.sr-only').text()).toBe('CONVERSATIONS.UNREAD_COUNT');
++    expect(wrapper.text()).toContain('3');
++  });
++
++  it('labels resolved conversations', () => {
++    const wrapper = mountItem({
++      conversation: { ...conversation, status: 'resolved' },
++    });
++    expect(wrapper.text()).toContain('CONVERSATIONS.RESOLVED');
++  });
++
++  it('is a button that selects the conversation', async () => {
++    const wrapper = mountItem();
++    expect(wrapper.element.tagName).toBe('BUTTON');
++    await wrapper.trigger('click');
++    expect(wrapper.emitted('select')).toEqual([[7]]);
++  });
++});
+diff --git a/app/javascript/widget/components/specs/TabBar.spec.js b/app/javascript/widget/components/specs/TabBar.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..511b37b2e691e7443a12fde741345fbab5c7ef75
+--- /dev/null
++++ b/app/javascript/widget/components/specs/TabBar.spec.js
+@@ -0,0 +1,86 @@
++import { mount } from '@vue/test-utils';
++import { createStore } from 'vuex';
++import TabBar from '../TabBar.vue';
++
++const replace = vi.fn();
++let routeName = 'home';
++
++vi.mock('vue-router', () => ({
++  useRouter: () => ({ replace }),
++  useRoute: () => ({ name: routeName }),
++}));
++
++const buildStore = ({ activeUnread = 0, otherUnread = 0 } = {}) =>
++  createStore({
++    modules: {
++      appConfig: {
++        namespaced: true,
++        getters: { getWidgetColor: () => '#1f93ff' },
++      },
++      conversation: {
++        namespaced: true,
++        getters: { getUnreadMessageCount: () => activeUnread },
++      },
++      conversationList: {
++        namespaced: true,
++        getters: { getUnreadCount: () => otherUnread },
++      },
++    },
++  });
++
++const mountBar = options =>
++  mount(TabBar, { global: { plugins: [buildStore(options)] } });
++
++describe('TabBar', () => {
++  beforeEach(() => {
++    routeName = 'home';
++  });
++
++  it('marks the tab of the current screen as the current page', () => {
++    const wrapper = mountBar();
++    const [home, messages] = wrapper.findAll('button');
++    expect(home.attributes('aria-current')).toBe('page');
++    expect(messages.attributes('aria-current')).toBe(undefined);
++  });
++
++  it('treats the conversation screens as the messages tab', () => {
++    routeName = 'messages';
++    const [, messages] = mountBar().findAll('button');
++    expect(messages.attributes('aria-current')).toBe('page');
++  });
++
++  it('counts the unread conversations on the messages tab', () => {
++    const wrapper = mountBar({ activeUnread: 5, otherUnread: 2 });
++    const badge = wrapper.find('.sr-only').element.parentElement;
++    expect(wrapper.find('[aria-hidden="true"] + .sr-only').text()).toBe(
++      'TABS.UNREAD_CONVERSATIONS'
++    );
++    expect(wrapper.text()).toContain('3');
++    expect(badge.classList).toContain('bg-n-slate-12');
++    expect(badge.style.backgroundColor).toBe('');
++  });
++
++  it('paints the badge in the widget colour while the messages tab is active', () => {
++    routeName = 'conversations';
++    const badge = mountBar({ otherUnread: 1 }).find('.sr-only').element
++      .parentElement;
++    expect(badge.classList).not.toContain('bg-n-slate-12');
++    expect(badge.style.backgroundColor).toBe('rgb(31, 147, 255)');
++  });
++
++  it('shows no badge without unread messages', () => {
++    expect(mountBar().find('.sr-only').exists()).toBe(false);
++  });
++
++  it('names each icon-only tab for screen readers', () => {
++    const [home, messages] = mountBar().findAll('button');
++    expect(home.attributes('aria-label')).toBe('TABS.HOME');
++    expect(messages.attributes('aria-label')).toBe('TABS.MESSAGES');
++  });
++
++  it('navigates to the tab screen', async () => {
++    const [, messages] = mountBar().findAll('button');
++    await messages.trigger('click');
++    expect(replace).toBeCalledWith({ name: 'conversations' });
++  });
++});
+diff --git a/app/javascript/widget/components/template/Article.vue b/app/javascript/widget/components/template/Article.vue
+index 218bab6f815a8db94d51e0345cf2f873dab7e8ff..027c5e4dcd676235d11be6eb64fbadc189644936 100644
+--- a/app/javascript/widget/components/template/Article.vue
++++ b/app/javascript/widget/components/template/Article.vue
+@@ -23,7 +23,7 @@ export default {
+ <template>
+   <div
+     v-if="!!items.length"
+-    class="chat-bubble agent bg-n-background dark:bg-n-solid-3"
++    class="chat-bubble agent bg-n-solid-1 dark:bg-n-solid-3"
+   >
+     <div
+       v-for="item in items"
+diff --git a/app/javascript/widget/helpers/actionCable.js b/app/javascript/widget/helpers/actionCable.js
+index 5463170183f5314060311ba371aa779a2e9a11a7..3a9749ad8d7ff3c464c5dda952528667ace4e217 100644
+--- a/app/javascript/widget/helpers/actionCable.js
++++ b/app/javascript/widget/helpers/actionCable.js
+@@ -1,15 +1,22 @@
+-import BaseActionCableConnector from '../../shared/helpers/BaseActionCableConnector';
++import {
++  IFrameHelper,
++  isMultipleConversationsEnabled,
++} from 'widget/helpers/utils';
+ import { playNewMessageNotificationInWidget } from 'widget/helpers/WidgetAudioNotificationHelper';
++import BaseActionCableConnector from '../../shared/helpers/BaseActionCableConnector';
++import { emitter } from '../../shared/helpers/mitt';
++import { CHATWOOT_ON_MESSAGE } from '../constants/sdkEvents';
+ import { ON_AGENT_MESSAGE_RECEIVED } from '../constants/widgetBusEvents';
+-import { IFrameHelper } from 'widget/helpers/utils';
+ import { shouldTriggerMessageUpdateEvent } from './IframeEventHelper';
+-import { CHATWOOT_ON_MESSAGE } from '../constants/sdkEvents';
+-import { emitter } from '../../shared/helpers/mitt';
++import { MESSAGE_TYPE } from './constants';
+ 
+ const isMessageInActiveConversation = (getters, message) => {
+   const { conversation_id: conversationId } = message;
+   const activeConversationId =
+     getters['conversationAttributes/getConversationParams'].id;
++  if (isMultipleConversationsEnabled()) {
++    return conversationId !== activeConversationId;
++  }
+   return activeConversationId && conversationId !== activeConversationId;
+ };
+ 
+@@ -39,6 +46,40 @@ class ActionCableConnector extends BaseActionCableConnector {
+     // Re-fetch conversation attributes so a status change (e.g. auto-resolve)
+     // that happened while disconnected is reflected, keeping the reply box state correct.
+     this.app.$store.dispatch('conversationAttributes/getAttributes');
++    this.refreshConversationList();
++  };
++
++  refreshConversationList = () => {
++    if (!isMultipleConversationsEnabled()) return;
++    this.app.$store.dispatch('conversationList/fetch');
++  };
++
++  // A message for another conversation takes over the screen only while the widget is hidden.
++  showsInActiveConversation = message => {
++    const { getters, dispatch } = this.app.$store;
++    const activeConversationId =
++      getters['conversationAttributes/getConversationParams'].id;
++    if (message.conversation_id === activeConversationId) return true;
++    if (!isMultipleConversationsEnabled()) return !activeConversationId;
++
++    // The campaign the visitor clicked creates its conversation later, in a job.
++    const isAwaitedCampaignMessage =
++      !activeConversationId &&
++      getters['conversation/getIsAwaitingCampaign'] &&
++      message.additional_attributes?.campaign_id;
++    if (isAwaitedCampaignMessage) {
++      dispatch('conversationList/attach', message.conversation_id);
++      return true;
++    }
++    // Only replies take over the screen; the visitor's own messages from elsewhere never do.
++    const isWidgetVisible =
++      getters['appConfig/getIsWidgetOpen'] || !IFrameHelper.isIFrame();
++    if (isWidgetVisible || message.message_type === MESSAGE_TYPE.INCOMING) {
++      dispatch('conversationList/fetch');
++      return false;
++    }
++    dispatch('conversationList/open', message.conversation_id);
++    return true;
+   };
+ 
+   setLastMessageId = () => {
+@@ -50,21 +91,27 @@ class ActionCableConnector extends BaseActionCableConnector {
+   };
+ 
+   onStatusChange = data => {
+-    if (data.status === 'resolved') {
++    // With multiple conversations a campaign prompt belongs to no existing conversation: clicking
++    // it starts a new one. Resolving any of them, even the one opened in the background, must
++    // leave the prompt alone.
++    if (data.status === 'resolved' && !isMultipleConversationsEnabled()) {
+       this.app.$store.dispatch('campaign/resetCampaign');
+     }
+     this.app.$store.dispatch('conversationAttributes/update', data);
++    this.refreshConversationList();
+   };
+ 
+   onMessageCreated = data => {
+-    if (isMessageInActiveConversation(this.app.$store.getters, data)) {
+-      return;
++    const showsInActiveConversation = this.showsInActiveConversation(data);
++    if (!showsInActiveConversation && !isMultipleConversationsEnabled()) return;
++
++    if (showsInActiveConversation) {
++      this.app.$store.dispatch('conversationList/updateLastMessage', data);
++      this.app.$store
++        .dispatch('conversation/addOrUpdateMessage', data)
++        .then(() => emitter.emit(ON_AGENT_MESSAGE_RECEIVED));
+     }
+ 
+-    this.app.$store
+-      .dispatch('conversation/addOrUpdateMessage', data)
+-      .then(() => emitter.emit(ON_AGENT_MESSAGE_RECEIVED));
+-
+     IFrameHelper.sendMessage({
+       event: 'onEvent',
+       eventIdentifier: CHATWOOT_ON_MESSAGE,
+@@ -76,6 +123,7 @@ class ActionCableConnector extends BaseActionCableConnector {
+   };
+ 
+   onMessageUpdated = data => {
++    if (data.content_attributes?.deleted) this.refreshConversationList();
+     if (isMessageInActiveConversation(this.app.$store.getters, data)) {
+       return;
+     }
+@@ -92,6 +140,10 @@ class ActionCableConnector extends BaseActionCableConnector {
+   };
+ 
+   onConversationCreated = () => {
++    if (isMultipleConversationsEnabled()) {
++      this.refreshConversationList();
++      return;
++    }
+     this.app.$store.dispatch('conversationAttributes/getAttributes');
+   };
+ 
+@@ -105,14 +157,15 @@ class ActionCableConnector extends BaseActionCableConnector {
+     ActionCableConnector.refreshConnector(pubsubToken);
+   };
+ 
+-  onTypingOn = data => {
++  isTypingInAnotherConversation = data => {
+     const activeConversationId =
+       this.app.$store.getters['conversationAttributes/getConversationParams']
+         .id;
+-    const isUserTypingOnAnotherConversation =
+-      data.conversation && data.conversation.id !== activeConversationId;
++    return data?.conversation && data.conversation.id !== activeConversationId;
++  };
+ 
+-    if (isUserTypingOnAnotherConversation || data.is_private) {
++  onTypingOn = data => {
++    if (this.isTypingInAnotherConversation(data) || data.is_private) {
+       return;
+     }
+     this.clearTimer();
+@@ -122,7 +175,8 @@ class ActionCableConnector extends BaseActionCableConnector {
+     this.initTimer();
+   };
+ 
+-  onTypingOff = () => {
++  onTypingOff = data => {
++    if (this.isTypingInAnotherConversation(data)) return;
+     this.clearTimer();
+     this.app.$store.dispatch('conversation/toggleAgentTyping', {
+       status: 'off',
+diff --git a/app/javascript/widget/helpers/axios.js b/app/javascript/widget/helpers/axios.js
+index 0369dae6221e5cbbf8b02937fe7da6ec134134f2..c5537d4df1c8893ba221a11532c9812f3a6e9ab9 100755
+--- a/app/javascript/widget/helpers/axios.js
++++ b/app/javascript/widget/helpers/axios.js
+@@ -1,11 +1,30 @@
+ import axios from 'axios';
+ import { APP_BASE_URL } from 'widget/helpers/constants';
++import { isMultipleConversationsEnabled } from 'widget/helpers/utils';
+ 
+ export const API = axios.create({
+   baseURL: APP_BASE_URL,
+   withCredentials: false,
+ });
+ 
++let activeConversationId = null;
++
++// With multiple conversations every request names its conversation, blank for a new one, so the
++// server can tell this widget apart from one loaded before the inbox enabled the feature.
++export const setActiveConversationId = id => {
++  activeConversationId = id || null;
++};
++
++API.interceptors.request.use(config => {
++  if (!isMultipleConversationsEnabled() || config.params?.conversation_id) {
++    return config;
++  }
++  return {
++    ...config,
++    params: { ...config.params, conversation_id: activeConversationId ?? '' },
++  };
++});
++
+ export const setHeader = (value, key = 'X-Auth-Token') => {
+   API.defaults.headers.common[key] = value;
+ };
+diff --git a/app/javascript/widget/helpers/specs/actionCable.spec.js b/app/javascript/widget/helpers/specs/actionCable.spec.js
+index 6aa3872bf14f18bd27f22f19420e5d52d4bd2cda..6c81975fe649564e4e75edb85e08a077771af213 100644
+--- a/app/javascript/widget/helpers/specs/actionCable.spec.js
++++ b/app/javascript/widget/helpers/specs/actionCable.spec.js
+@@ -1,5 +1,6 @@
+ import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest';
+ import ActionCableConnector from '../actionCable';
++import { IFrameHelper } from 'widget/helpers/utils';
+ 
+ vi.mock('@rails/actioncable', () => ({
+   createConsumer: () => ({
+@@ -8,6 +9,18 @@ vi.mock('@rails/actioncable', () => ({
+   }),
+ }));
+ 
++vi.mock('widget/helpers/utils', async importOriginal => {
++  const utils = await importOriginal();
++  return {
++    ...utils,
++    IFrameHelper: {
++      ...utils.IFrameHelper,
++      isIFrame: vi.fn(),
++      sendMessage: vi.fn(),
++    },
++  };
++});
++
+ describe('Widget ActionCableConnector', () => {
+   let app;
+   let mockDispatch;
+@@ -40,6 +53,288 @@ describe('Widget ActionCableConnector', () => {
+     );
+   });
+ 
++  describe('with multiple conversations enabled', () => {
++    const message = { id: 10, conversation_id: 2, sender_type: 'Contact' };
++    const getters = {
++      'conversationAttributes/getConversationParams': { id: 1 },
++      'appConfig/getIsWidgetOpen': false,
++    };
++
++    beforeEach(() => {
++      window.chatwootWebChannel = {
++        enabledFeatures: ['multiple_conversations'],
++      };
++      mockDispatch.mockResolvedValue(undefined);
++      app.$store.getters = getters;
++      IFrameHelper.isIFrame.mockReturnValue(true);
++    });
++
++    afterEach(() => {
++      delete window.chatwootWebChannel;
++    });
++
++    it('renders a message for the conversation on screen and keeps its row current', () => {
++      connector.onMessageCreated({ ...message, conversation_id: 1 });
++
++      expect(mockDispatch).toBeCalledWith('conversation/addOrUpdateMessage', {
++        ...message,
++        conversation_id: 1,
++      });
++      expect(mockDispatch).toBeCalledWith(
++        'conversationList/updateLastMessage',
++        {
++          ...message,
++          conversation_id: 1,
++        }
++      );
++      expect(mockDispatch).not.toBeCalledWith('conversationList/fetch');
++    });
++
++    it('applies message updates only to the conversation on screen', () => {
++      connector.onMessageUpdated({ ...message, conversation_id: 1 });
++      connector.onMessageUpdated(message);
++
++      expect(mockDispatch.mock.calls).toEqual([
++        ['conversation/addOrUpdateMessage', { ...message, conversation_id: 1 }],
++      ]);
++    });
++
++    it('ignores message updates of earlier conversations on a new thread', () => {
++      app.$store.getters = {
++        ...getters,
++        'conversationAttributes/getConversationParams': { id: '' },
++      };
++
++      connector.onMessageUpdated(message);
++
++      expect(mockDispatch).not.toBeCalled();
++    });
++
++    it('switches to the conversation of a new message while the widget is closed', () => {
++      connector.onMessageCreated(message);
++
++      expect(mockDispatch).toBeCalledWith('conversationList/open', 2);
++      expect(mockDispatch).toBeCalledWith(
++        'conversation/addOrUpdateMessage',
++        message
++      );
++      expect(IFrameHelper.sendMessage).toBeCalledWith(
++        expect.objectContaining({ event: 'onEvent', data: message })
++      );
++    });
++
++    it('keeps a new thread on screen when an earlier conversation gets a reply', () => {
++      app.$store.getters = {
++        ...getters,
++        'conversationAttributes/getConversationParams': { id: '' },
++        'appConfig/getIsWidgetOpen': true,
++        'conversation/getIsCreating': true,
++      };
++      const reply = { ...message, message_type: 1 };
++
++      connector.onMessageCreated(reply);
++
++      expect(mockDispatch.mock.calls).toEqual([['conversationList/fetch']]);
++    });
++
++    it('attaches the conversation of the campaign the visitor clicked', () => {
++      app.$store.getters = {
++        ...getters,
++        'conversationAttributes/getConversationParams': { id: '' },
++        'appConfig/getIsWidgetOpen': true,
++        'conversation/getIsAwaitingCampaign': true,
++      };
++      const campaignMessage = {
++        ...message,
++        message_type: 1,
++        additional_attributes: { campaign_id: 7 },
++      };
++
++      connector.onMessageCreated(campaignMessage);
++
++      expect(mockDispatch).toBeCalledWith('conversationList/attach', 2);
++      expect(mockDispatch).toBeCalledWith(
++        'conversation/addOrUpdateMessage',
++        campaignMessage
++      );
++    });
++
++    it('does not take a reply of an earlier conversation for the awaited campaign', () => {
++      app.$store.getters = {
++        ...getters,
++        'conversationAttributes/getConversationParams': { id: '' },
++        'appConfig/getIsWidgetOpen': true,
++        'conversation/getIsAwaitingCampaign': true,
++      };
++
++      connector.onMessageCreated({ ...message, message_type: 1 });
++
++      expect(mockDispatch.mock.calls).toEqual([['conversationList/fetch']]);
++    });
++
++    it('never lets the visitor own messages from elsewhere take over a new thread', () => {
++      app.$store.getters = {
++        ...getters,
++        'conversationAttributes/getConversationParams': { id: '' },
++      };
++      const ownMessage = { ...message, message_type: 0 };
++
++      connector.onMessageCreated(ownMessage);
++
++      expect(mockDispatch).toBeCalledWith('conversationList/fetch');
++      expect(mockDispatch).not.toBeCalledWith('conversationList/open', 2);
++      expect(mockDispatch).not.toBeCalledWith(
++        'conversation/addOrUpdateMessage',
++        ownMessage
++      );
++    });
++
++    it('only refreshes the list when the visitor is viewing another conversation', () => {
++      app.$store.getters = { ...getters, 'appConfig/getIsWidgetOpen': true };
++
++      connector.onMessageCreated(message);
++
++      expect(mockDispatch).toBeCalledWith('conversationList/fetch');
++      expect(mockDispatch).not.toBeCalledWith(
++        'conversation/addOrUpdateMessage',
++        message
++      );
++      expect(IFrameHelper.sendMessage).toBeCalledWith(
++        expect.objectContaining({ event: 'onEvent', data: message })
++      );
++    });
++
++    it('refreshes the list instead of moving to a newly created conversation', () => {
++      connector.onConversationCreated();
++
++      expect(mockDispatch.mock.calls).toEqual([['conversationList/fetch']]);
++    });
++
++    it('refreshes the list when a message is deleted', () => {
++      connector.onMessageUpdated({
++        ...message,
++        content_attributes: { deleted: true },
++      });
++
++      expect(mockDispatch).toBeCalledWith('conversationList/fetch');
++    });
++
++    // A campaign prompt never belongs to an existing conversation: clicking it starts a new one.
++    it('keeps the campaign prompt when another conversation is resolved', () => {
++      connector.onStatusChange({ id: 2, status: 'resolved' });
++      expect(mockDispatch).not.toBeCalledWith('campaign/resetCampaign');
++    });
++
++    it('keeps the campaign prompt when the conversation opened in the background is resolved', () => {
++      connector.onStatusChange({ id: 1, status: 'resolved' });
++      expect(mockDispatch).not.toBeCalledWith('campaign/resetCampaign');
++      expect(mockDispatch).toBeCalledWith('conversationAttributes/update', {
++        id: 1,
++        status: 'resolved',
++      });
++    });
++
++    it('refreshes the list on status changes and reconnects', () => {
++      connector.onStatusChange({ id: 2, status: 'resolved' });
++      connector.onReconnect();
++
++      expect(mockDispatch).toBeCalledWith('conversationAttributes/update', {
++        id: 2,
++        status: 'resolved',
++      });
++      expect(
++        mockDispatch.mock.calls.filter(
++          ([action]) => action === 'conversationList/fetch'
++        )
++      ).toHaveLength(2);
++    });
++  });
++
++  describe('with multiple conversations disabled', () => {
++    beforeEach(() => {
++      mockDispatch.mockResolvedValue(undefined);
++      app.$store.getters = {
++        'conversationAttributes/getConversationParams': { id: 1 },
++      };
++    });
++
++    it('resets the campaign when any conversation is resolved', () => {
++      connector.onStatusChange({ id: 2, status: 'resolved' });
++      expect(mockDispatch).toBeCalledWith('campaign/resetCampaign');
++    });
++
++    it('ignores messages of other conversations entirely', () => {
++      connector.onMessageCreated({ id: 10, conversation_id: 2 });
++
++      expect(mockDispatch).not.toBeCalled();
++      expect(IFrameHelper.sendMessage).not.toBeCalled();
++    });
++
++    it('applies message updates while no conversation is known yet', () => {
++      app.$store.getters = {
++        'conversationAttributes/getConversationParams': { id: '' },
++      };
++
++      connector.onMessageUpdated({ id: 10, conversation_id: 2 });
++
++      expect(mockDispatch).toBeCalledWith('conversation/addOrUpdateMessage', {
++        id: 10,
++        conversation_id: 2,
++      });
++    });
++
++    it('moves to a newly created conversation', () => {
++      connector.onConversationCreated();
++
++      expect(mockDispatch.mock.calls).toEqual([
++        ['conversationAttributes/getAttributes'],
++      ]);
++    });
++  });
++
++  describe('typing indicator', () => {
++    const typing = conversationId => ({
++      conversation: { id: conversationId },
++      is_private: false,
++    });
++
++    beforeEach(() => {
++      app.$store.getters = {
++        'conversationAttributes/getConversationParams': { id: 1 },
++      };
++    });
++
++    it('keeps it when an agent stops typing in another conversation', () => {
++      connector.onTypingOn(typing(1));
++      mockDispatch.mockClear();
++
++      connector.onTypingOff(typing(2));
++
++      expect(mockDispatch).not.toBeCalled();
++    });
++
++    it('clears it when the agent stops typing in the conversation on screen', () => {
++      connector.onTypingOn(typing(1));
++      connector.onTypingOff(typing(1));
++
++      expect(mockDispatch).toHaveBeenLastCalledWith(
++        'conversation/toggleAgentTyping',
++        { status: 'off' }
++      );
++    });
++
++    it('clears it on its own after 30 seconds', () => {
++      connector.onTypingOn(typing(1));
++      mockDispatch.mockClear();
++
++      vi.advanceTimersByTime(30000);
++
++      expect(mockDispatch).toBeCalledWith('conversation/toggleAgentTyping', {
++        status: 'off',
++      });
++    });
++  });
++
+   it('re-fetches conversation attributes on reconnect so a status change missed while disconnected is reflected', () => {
+     connector.onReconnect();
+ 
+diff --git a/app/javascript/widget/helpers/specs/axios.spec.js b/app/javascript/widget/helpers/specs/axios.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..f59940dff513a5081064a51d9a3a32118766e30c
+--- /dev/null
++++ b/app/javascript/widget/helpers/specs/axios.spec.js
+@@ -0,0 +1,61 @@
++import { API, setActiveConversationId } from '../axios';
++
++describe('widget API client', () => {
++  beforeEach(() => {
++    API.defaults.adapter = async config => ({
++      data: {},
++      status: 200,
++      statusText: 'OK',
++      headers: {},
++      config,
++    });
++  });
++
++  afterEach(() => {
++    setActiveConversationId(null);
++    delete window.chatwootWebChannel;
++  });
++
++  it('names the active conversation on every request when multiple conversations are enabled', async () => {
++    window.chatwootWebChannel = { enabledFeatures: ['multiple_conversations'] };
++    setActiveConversationId(42);
++
++    const { config } = await API.get('/api/v1/widget/messages', {
++      params: { before: 7 },
++    });
++
++    expect(config.params).toEqual({ before: 7, conversation_id: 42 });
++  });
++
++  it('keeps the conversation a request already names', async () => {
++    window.chatwootWebChannel = { enabledFeatures: ['multiple_conversations'] };
++    setActiveConversationId(42);
++
++    const { config } = await API.post(
++      '/api/v1/widget/messages',
++      {},
++      { params: { conversation_id: 7 } }
++    );
++
++    expect(config.params).toEqual({ conversation_id: 7 });
++  });
++
++  it('leaves requests untouched when multiple conversations are disabled', async () => {
++    setActiveConversationId(42);
++
++    const { config } = await API.get('/api/v1/widget/messages', {
++      params: { before: 7 },
++    });
++
++    expect(config.params).toEqual({ before: 7 });
++  });
++
++  it('asks for a new conversation when none is active', async () => {
++    window.chatwootWebChannel = { enabledFeatures: ['multiple_conversations'] };
++    setActiveConversationId('');
++
++    const { config } = await API.post('/api/v1/widget/messages', {});
++
++    expect(config.params).toEqual({ conversation_id: '' });
++  });
++});
+diff --git a/app/javascript/widget/helpers/utils.js b/app/javascript/widget/helpers/utils.js
+index 67906d4ee39818ac014421d207a41bde886fbe41..937539b2760b0179c451a26b0657b7415eaddd1d 100755
+--- a/app/javascript/widget/helpers/utils.js
++++ b/app/javascript/widget/helpers/utils.js
+@@ -30,6 +30,13 @@ export const RNHelper = {
+   },
+ };
+ 
++export const isMultipleConversationsEnabled = () =>
++  Boolean(
++    window.chatwootWebChannel?.enabledFeatures?.includes(
++      'multiple_conversations'
++    )
++  );
++
+ export const groupBy = (array, predicate) => {
+   return array.reduce((acc, value) => {
+     (acc[predicate(value)] ||= []).push(value);
+diff --git a/app/javascript/widget/i18n/locale/en.json b/app/javascript/widget/i18n/locale/en.json
+index 0cfc9d00a62c08b6cbc9bf98bf260ebedc63398f..f7ddb74555a7fb9359408a16bf73099deeac471d 100644
+--- a/app/javascript/widget/i18n/locale/en.json
++++ b/app/javascript/widget/i18n/locale/en.json
+@@ -47,6 +47,20 @@
+   "CONTINUE_CONVERSATION": "Continue conversation",
+   "YOU": "You",
+   "START_NEW_CONVERSATION": "Start a new conversation",
++  "BACK": "Go back",
++  "TABS": {
++    "HOME": "Home",
++    "MESSAGES": "Messages",
++    "UNREAD_CONVERSATIONS": "{count} unread conversation | {count} unread conversations"
++  },
++  "CONVERSATIONS": {
++    "TITLE": "All conversations",
++    "EMPTY_TITLE": "No conversations yet",
++    "EMPTY_DESCRIPTION": "Start a conversation and we will get back to you here.",
++    "RESOLVED": "Resolved",
++    "UNREAD_COUNT": "{count} unread message | {count} unread messages",
++    "ATTACHMENT": "Attachment"
++  },
+   "VIEW_UNREAD_MESSAGES": "You have unread messages",
+   "UNREAD_VIEW": {
+     "VIEW_MESSAGES_BUTTON": "See new messages",
+diff --git a/app/javascript/widget/mixins/configMixin.js b/app/javascript/widget/mixins/configMixin.js
+index 7eb11e18b9fc55e057c4bd49bcdbf9519f55045a..0ae7c6a3711c7508f3336e313a0c5d37ea66de7e 100644
+--- a/app/javascript/widget/mixins/configMixin.js
++++ b/app/javascript/widget/mixins/configMixin.js
+@@ -1,5 +1,10 @@
++import { isMultipleConversationsEnabled } from 'widget/helpers/utils';
++
+ export default {
+   computed: {
++    hasMultipleConversationsEnabled() {
++      return isMultipleConversationsEnabled();
++    },
+     useInboxAvatarForBot() {
+       return this.channelConfig.enabledFeatures.includes(
+         'use_inbox_avatar_for_bot'
+diff --git a/app/javascript/widget/router.js b/app/javascript/widget/router.js
+index e8230c2d99adcc76c134c98a408650f456ff32ca..0bd09c02a2c65e80d1ba27033d6c07816e0855a2 100755
+--- a/app/javascript/widget/router.js
++++ b/app/javascript/widget/router.js
+@@ -34,6 +34,11 @@ const router = createRouter({
+           name: 'messages',
+           component: () => import('./views/Messages.vue'),
+         },
++        {
++          path: '/conversations',
++          name: 'conversations',
++          component: () => import('./views/ConversationList.vue'),
++        },
+         {
+           path: '/article',
+           name: 'article-viewer',
+diff --git a/app/javascript/widget/store/index.js b/app/javascript/widget/store/index.js
+index 22115d5b1b4a019783309100198631f444765c64..ee4ee601116901a836a1f803f8e32ff55cf59715 100755
+--- a/app/javascript/widget/store/index.js
++++ b/app/javascript/widget/store/index.js
+@@ -5,6 +5,7 @@ import appConfig from 'widget/store/modules/appConfig';
+ import contacts from 'widget/store/modules/contacts';
+ import conversation from 'widget/store/modules/conversation';
+ import conversationAttributes from 'widget/store/modules/conversationAttributes';
++import conversationList from 'widget/store/modules/conversationList';
+ import conversationLabels from 'widget/store/modules/conversationLabels';
+ import events from 'widget/store/modules/events';
+ import globalConfig from 'shared/store/globalConfig';
+@@ -20,6 +21,7 @@ export default createStore({
+     conversation,
+     conversationAttributes,
+     conversationLabels,
++    conversationList,
+     events,
+     globalConfig,
+     message,
+diff --git a/app/javascript/widget/store/modules/campaign.js b/app/javascript/widget/store/modules/campaign.js
+index 050189fe55bc2d7419c8aa092043e660d56689c2..e08213a9dcc8d50532bb71ac477d5d2f7ba48e54 100644
+--- a/app/javascript/widget/store/modules/campaign.js
++++ b/app/javascript/widget/store/modules/campaign.js
+@@ -127,9 +127,10 @@ export const actions = {
+     { campaignId, websiteToken, customAttributes }
+   ) => {
+     try {
++      // The campaign message can arrive before this request returns, so it is awaited up front.
+       commit(
+         'conversation/setConversationUIFlag',
+-        { isCreating: true },
++        { isCreating: true, isAwaitingCampaign: true },
+         { root: true }
+       );
+       await triggerCampaign({ campaignId, websiteToken, customAttributes });
+@@ -137,6 +138,11 @@ export const actions = {
+       commit('setActiveCampaign', {});
+     } catch (error) {
+       commit('setError', true);
++      commit(
++        'conversation/setConversationUIFlag',
++        { isAwaitingCampaign: false },
++        { root: true }
++      );
+     } finally {
+       commit(
+         'conversation/setConversationUIFlag',
+diff --git a/app/javascript/widget/store/modules/contacts.js b/app/javascript/widget/store/modules/contacts.js
+index 89af9ea3458509be32a668f9e8f95ad6b2814a45..b24c98183d8fc0ea2c50a994f1dda862f710aef8 100644
+--- a/app/javascript/widget/store/modules/contacts.js
++++ b/app/javascript/widget/store/modules/contacts.js
+@@ -1,4 +1,7 @@
+-import { sendMessage } from 'widget/helpers/utils';
++import {
++  sendMessage,
++  isMultipleConversationsEnabled,
++} from 'widget/helpers/utils';
+ import ContactsAPI from '../../api/contacts';
+ import { SET_USER_ERROR } from '../../constants/errorTypes';
+ import { setHeader } from '../../helpers/axios';
+@@ -78,9 +81,14 @@ export const actions = {
+       updateWidgetAuthToken(widgetAuthToken);
+       dispatch('get');
+       if (identifierHash || widgetAuthToken) {
+-        dispatch('conversation/clearConversations', {}, { root: true });
+-        dispatch('conversation/fetchOldConversations', {}, { root: true });
+-        dispatch('conversationAttributes/getAttributes', {}, { root: true });
++        if (isMultipleConversationsEnabled()) {
++          dispatch('conversationList/switchIdentity', {}, { root: true });
++          dispatch('conversationList/load', {}, { root: true });
++        } else {
++          dispatch('conversation/clearConversations', {}, { root: true });
++          dispatch('conversation/fetchOldConversations', {}, { root: true });
++          dispatch('conversationAttributes/getAttributes', {}, { root: true });
++        }
+       }
+     } catch (error) {
+       const data = parseErrorData(error);
+diff --git a/app/javascript/widget/store/modules/conversation/actions.js b/app/javascript/widget/store/modules/conversation/actions.js
+index aa08af61535743255ac5b26e33ab94dd1dc87681..157bdb441d5ef3ad2f1bacb3505bbc67569d5b6a 100644
+--- a/app/javascript/widget/store/modules/conversation/actions.js
++++ b/app/javascript/widget/store/modules/conversation/actions.js
+@@ -11,23 +11,64 @@ import {
+ } from 'widget/api/conversation';
+ 
+ import { ON_CONVERSATION_CREATED } from 'widget/constants/widgetBusEvents';
+-import { createTemporaryMessage, getNonDeletedMessages } from './helpers';
++import {
++  createTemporaryMessage,
++  getNonDeletedMessages,
++  hasLeftConversation,
++} from './helpers';
+ import { emitter } from 'shared/helpers/mitt';
++import { isMultipleConversationsEnabled } from 'widget/helpers/utils';
++
++// A new thread has no id until its first message creates the conversation, so messages sent
++// meanwhile from the same thread wait for that request and post to the conversation it created.
++let pendingCreation = null;
++
++const postToThread = ({ commit, rootState }, post) => {
++  const { conversationAttributes, conversationList } = rootState;
++  if (!isMultipleConversationsEnabled() || conversationAttributes.id) {
++    return post();
++  }
++  if (pendingCreation?.thread === conversationList.thread) {
++    return pendingCreation.request.then(({ data }) =>
++      post(data.conversation_id)
++    );
++  }
++  const creation = { thread: conversationList.thread, request: post() };
++  pendingCreation = creation;
++  commit('setConversationUIFlag', { isCreating: true });
++  const clear = () => {
++    if (pendingCreation !== creation) return;
++    pendingCreation = null;
++    commit('setConversationUIFlag', { isCreating: false });
++  };
++  creation.request.then(clear, clear);
++  return creation.request;
++};
++
+ export const actions = {
+-  createConversation: async ({ commit, dispatch }, params) => {
++  createConversation: async ({ commit, dispatch, rootState }, params) => {
++    const { thread } = rootState.conversationList;
+     commit('setConversationUIFlag', { isCreating: true });
+     try {
+       const { data } = await createConversationAPI(params);
++      if (hasLeftConversation(rootState, thread)) return;
+       const { messages } = data;
+       const [message = {}] = messages;
+       commit('pushMessageToConversation', message);
+-      dispatch('conversationAttributes/getAttributes', {}, { root: true });
++      if (isMultipleConversationsEnabled()) {
++        dispatch('conversationList/adopt', data.id, { root: true });
++      } else {
++        dispatch('conversationAttributes/getAttributes', {}, { root: true });
++      }
+       // Emit event to notify that conversation is created and show the chat screen
+       emitter.emit(ON_CONVERSATION_CREATED);
+     } catch (error) {
+       // Ignore error
+     } finally {
+-      commit('setConversationUIFlag', { isCreating: false });
++      // Leaving the thread already reset it; another thread may be creating by now.
++      if (!hasLeftConversation(rootState, thread)) {
++        commit('setConversationUIFlag', { isCreating: false });
++      }
+     }
+   },
+   sendMessage: async ({ dispatch, state: conversationState }, params) => {
+@@ -41,23 +82,34 @@ export const actions = {
+     });
+   },
+   sendMessageWithData: async (
+-    { commit },
++    { commit, dispatch, rootState },
+     { message, pendingCustomAttributes = {}, pendingLabels = [] }
+   ) => {
+     const { id, content, replyTo, meta = {} } = message;
+     const hasPendingMetadata =
+       Object.keys(pendingCustomAttributes).length > 0 ||
+       pendingLabels.length > 0;
++    const { thread } = rootState.conversationList;
+ 
+-    commit('pushMessageToConversation', message);
++    // A retried message arrives marked failed; in progress again, the sent copy replaces it.
++    commit('pushMessageToConversation', { ...message, status: 'in_progress' });
+     commit('updateMessageMeta', { id, meta: { ...meta, error: '' } });
+     try {
+-      const { data } = await sendMessageAPI(content, replyTo, {
+-        customAttributes: hasPendingMetadata
+-          ? pendingCustomAttributes
+-          : undefined,
+-        labels: hasPendingMetadata ? pendingLabels : undefined,
+-      });
++      const { data } = await postToThread(
++        { commit, rootState },
++        conversationId =>
++          sendMessageAPI(content, replyTo, {
++            customAttributes: hasPendingMetadata
++              ? pendingCustomAttributes
++              : undefined,
++            labels: hasPendingMetadata ? pendingLabels : undefined,
++            conversationId,
++          })
++      );
++      if (hasLeftConversation(rootState, thread)) {
++        commit('deleteMessage', id);
++        return;
++      }
+       if (hasPendingMetadata) {
+         commit('clearPendingConversationMetadata');
+       }
+@@ -65,7 +117,19 @@ export const actions = {
+       // [VITE] Don't delete this manually, since `pushMessageToConversation` does the replacement for us anyway
+       // commit('deleteMessage', message.id);
+       commit('pushMessageToConversation', { ...data, status: 'sent' });
++      if (
++        isMultipleConversationsEnabled() &&
++        !rootState.conversationAttributes.id
++      ) {
++        dispatch('conversationList/adopt', data.conversation_id, {
++          root: true,
++        });
++      }
+     } catch (error) {
++      if (hasLeftConversation(rootState, thread)) {
++        commit('deleteMessage', id);
++        return;
++      }
+       commit('pushMessageToConversation', { ...message, status: 'failed' });
+       commit('updateMessageMeta', {
+         id,
+@@ -78,7 +142,10 @@ export const actions = {
+     commit('setLastMessageId');
+   },
+ 
+-  sendAttachment: async ({ commit, state: conversationState }, params) => {
++  sendAttachment: async (
++    { commit, dispatch, rootState, state: conversationState },
++    params
++  ) => {
+     const {
+       attachment: { thumbUrl, fileType },
+       meta = {},
+@@ -97,15 +164,25 @@ export const actions = {
+     const hasPendingMetadata =
+       Object.keys(pendingCustomAttributes).length > 0 ||
+       pendingLabels.length > 0;
++    const { thread } = rootState.conversationList;
+ 
+     commit('pushMessageToConversation', tempMessage);
+     try {
+-      const { data } = await sendAttachmentAPI(params, {
+-        customAttributes: hasPendingMetadata
+-          ? pendingCustomAttributes
+-          : undefined,
+-        labels: hasPendingMetadata ? pendingLabels : undefined,
+-      });
++      const { data } = await postToThread(
++        { commit, rootState },
++        conversationId =>
++          sendAttachmentAPI(params, {
++            customAttributes: hasPendingMetadata
++              ? pendingCustomAttributes
++              : undefined,
++            labels: hasPendingMetadata ? pendingLabels : undefined,
++            conversationId,
++          })
++      );
++      if (hasLeftConversation(rootState, thread)) {
++        commit('deleteMessage', tempMessage.id);
++        return;
++      }
+       if (hasPendingMetadata) {
+         commit('clearPendingConversationMetadata');
+       }
+@@ -114,7 +191,19 @@ export const actions = {
+         tempId: tempMessage.id,
+       });
+       commit('pushMessageToConversation', { ...data, status: 'sent' });
++      if (
++        isMultipleConversationsEnabled() &&
++        !rootState.conversationAttributes.id
++      ) {
++        dispatch('conversationList/adopt', data.conversation_id, {
++          root: true,
++        });
++      }
+     } catch (error) {
++      if (hasLeftConversation(rootState, thread)) {
++        commit('deleteMessage', tempMessage.id);
++        return;
++      }
+       commit('pushMessageToConversation', { ...tempMessage, status: 'failed' });
+       commit('updateMessageMeta', {
+         id: tempMessage.id,
+@@ -123,29 +212,37 @@ export const actions = {
+       // Show error
+     }
+   },
+-  fetchOldConversations: async ({ commit }, { before } = {}) => {
++  fetchOldConversations: async ({ commit, rootState }, { before } = {}) => {
++    const { thread } = rootState.conversationList;
+     try {
+       commit('setConversationListLoading', true);
+       const {
+         data: { payload, meta },
+       } = await getMessagesAPI({ before });
++      if (hasLeftConversation(rootState, thread)) return;
+       const { contact_last_seen_at: lastSeen } = meta;
+       const formattedMessages = getNonDeletedMessages({ messages: payload });
+       commit('conversation/setMetaUserLastSeenAt', lastSeen, { root: true });
+       commit('setMessagesInConversation', formattedMessages);
+-      commit('setConversationListLoading', false);
++      if (!before) commit('setConversationUIFlag', { hasLoadFailed: false });
+     } catch (error) {
++      if (!before && !hasLeftConversation(rootState, thread)) {
++        commit('setConversationUIFlag', { hasLoadFailed: true });
++      }
++    } finally {
+       commit('setConversationListLoading', false);
+     }
+   },
+ 
+-  syncLatestMessages: async ({ state, commit }) => {
++  syncLatestMessages: async ({ state, commit, rootState }) => {
++    const { thread } = rootState.conversationList;
+     try {
+       const { lastMessageId, conversations } = state;
+ 
+       const {
+         data: { payload, meta },
+       } = await getMessagesAPI({ after: lastMessageId });
++      if (hasLeftConversation(rootState, thread)) return;
+ 
+       const { contact_last_seen_at: lastSeen } = meta;
+       const formattedMessages = getNonDeletedMessages({ messages: payload });
+@@ -194,7 +291,7 @@ export const actions = {
+     }
+   },
+ 
+-  setUserLastSeen: async ({ commit, getters: appGetters }) => {
++  setUserLastSeen: async ({ commit, getters: appGetters, rootState }) => {
+     if (!appGetters.getConversationSize) {
+       return;
+     }
+@@ -202,6 +299,9 @@ export const actions = {
+     const lastSeen = Date.now() / 1000;
+     try {
+       commit('setMetaUserLastSeenAt', lastSeen);
++      commit('conversationList/markRead', rootState.conversationAttributes.id, {
++        root: true,
++      });
+       await setUserLastSeenAt({ lastSeen });
+     } catch (error) {
+       // IgnoreError
+diff --git a/app/javascript/widget/store/modules/conversation/getters.js b/app/javascript/widget/store/modules/conversation/getters.js
+index ef1cd1cc3905f0194dd3df4e4e3fa2cdc23ad0d8..a83be925542bb6da07b1088e2efc0396ca5ef26e 100644
+--- a/app/javascript/widget/store/modules/conversation/getters.js
++++ b/app/javascript/widget/store/modules/conversation/getters.js
+@@ -6,6 +6,8 @@ import { formatUnixDate } from 'shared/helpers/DateHelper';
+ export const getters = {
+   getAllMessagesLoaded: _state => _state.uiFlags.allMessagesLoaded,
+   getIsCreating: _state => _state.uiFlags.isCreating,
++  getIsAwaitingCampaign: _state => _state.uiFlags.isAwaitingCampaign,
++  getHasLoadFailed: _state => _state.uiFlags.hasLoadFailed,
+   getIsAgentTyping: _state => _state.uiFlags.isAgentTyping,
+   getConversation: _state => _state.conversations,
+   getConversationSize: _state => Object.keys(_state.conversations).length,
+diff --git a/app/javascript/widget/store/modules/conversation/helpers.js b/app/javascript/widget/store/modules/conversation/helpers.js
+index 1e870d26c3dd24f64aa91ffb956c68b5f8931bdd..203bd6479caa08bb7cd0bd2b538a9aa2f05c406a 100644
+--- a/app/javascript/widget/store/modules/conversation/helpers.js
++++ b/app/javascript/widget/store/modules/conversation/helpers.js
+@@ -1,5 +1,6 @@
+ import { MESSAGE_TYPE } from 'widget/helpers/constants';
+ import { isASubmittedFormMessage } from 'shared/helpers/MessageTypeHelper';
++import { isMultipleConversationsEnabled } from 'widget/helpers/utils';
+ 
+ import getUuid from '../../../helpers/uuid';
+ export const createTemporaryMessage = ({ attachments, content, replyTo }) => {
+@@ -54,3 +55,8 @@ export const getNonDeletedMessages = ({ messages }) => {
+     item => !(item.content_attributes && item.content_attributes.deleted)
+   );
+ };
++
++// A response can arrive after the visitor moved to another conversation.
++export const hasLeftConversation = (rootState, thread) =>
++  isMultipleConversationsEnabled() &&
++  rootState.conversationList.thread !== thread;
+diff --git a/app/javascript/widget/store/modules/conversation/index.js b/app/javascript/widget/store/modules/conversation/index.js
+index 077a16a040086dcd3a7330af7128daab225181e6..d45819fc65cc6f9f9797904da5f31b0495965b58 100755
+--- a/app/javascript/widget/store/modules/conversation/index.js
++++ b/app/javascript/widget/store/modules/conversation/index.js
+@@ -12,6 +12,9 @@ const state = {
+     isFetchingList: false,
+     isAgentTyping: false,
+     isCreating: false,
++    isAwaitingCampaign: false,
++    // The first page of the thread on screen failed to load, so reopening it must retry.
++    hasLoadFailed: false,
+   },
+   lastMessageId: null,
+   pendingCustomAttributes: {},
+diff --git a/app/javascript/widget/store/modules/conversation/mutations.js b/app/javascript/widget/store/modules/conversation/mutations.js
+index 1c23e008dbe30fb88a516222fb5e3184526e20ac..1df1f978754039c270009771fdc9e27bae96ce8e 100644
+--- a/app/javascript/widget/store/modules/conversation/mutations.js
++++ b/app/javascript/widget/store/modules/conversation/mutations.js
+@@ -4,6 +4,12 @@ import { findUndeliveredMessage } from './helpers';
+ export const mutations = {
+   clearConversations($state) {
+     $state.conversations = {};
++    $state.lastMessageId = null;
++    $state.uiFlags.allMessagesLoaded = false;
++    $state.uiFlags.isAgentTyping = false;
++    $state.uiFlags.isCreating = false;
++    $state.uiFlags.isAwaitingCampaign = false;
++    $state.uiFlags.hasLoadFailed = false;
+     $state.pendingCustomAttributes = {};
+     $state.pendingLabels = [];
+   },
+diff --git a/app/javascript/widget/store/modules/conversationAttributes.js b/app/javascript/widget/store/modules/conversationAttributes.js
+index ddcd8d6e052759f37cb2d37625c7b45d51cefe2c..17c367dd23707e5b2408c8b8b7680461f68c4e47 100644
+--- a/app/javascript/widget/store/modules/conversationAttributes.js
++++ b/app/javascript/widget/store/modules/conversationAttributes.js
+@@ -4,6 +4,8 @@ import {
+   CLEAR_CONVERSATION_ATTRIBUTES,
+ } from '../types';
+ import { getConversationAPI } from '../../api/conversation';
++import { setActiveConversationId } from '../../helpers/axios';
++import { isMultipleConversationsEnabled } from '../../helpers/utils';
+ 
+ const state = {
+   id: '',
+@@ -15,9 +17,10 @@ export const getters = {
+ };
+ 
+ export const actions = {
+-  getAttributes: async ({ commit }) => {
++  getAttributes: async ({ commit, state: attributes }) => {
+     try {
+       const { data } = await getConversationAPI();
++      if (isMultipleConversationsEnabled() && data.id !== attributes.id) return;
+       const { contact_last_seen_at: lastSeen } = data;
+       commit(SET_CONVERSATION_ATTRIBUTES, data);
+       commit('conversation/setMetaUserLastSeenAt', lastSeen, { root: true });
+@@ -37,6 +40,7 @@ export const mutations = {
+   [SET_CONVERSATION_ATTRIBUTES]($state, data) {
+     $state.id = data.id;
+     $state.status = data.status;
++    setActiveConversationId(data.id);
+   },
+   [UPDATE_CONVERSATION_ATTRIBUTES]($state, data) {
+     if (data.id === $state.id) {
+@@ -47,6 +51,7 @@ export const mutations = {
+   [CLEAR_CONVERSATION_ATTRIBUTES]($state) {
+     $state.id = '';
+     $state.status = '';
++    setActiveConversationId(null);
+   },
+ };
+ 
+diff --git a/app/javascript/widget/store/modules/conversationList.js b/app/javascript/widget/store/modules/conversationList.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1606d43e7be50fd7d4e01b2b10e37176198db7c
+--- /dev/null
++++ b/app/javascript/widget/store/modules/conversationList.js
+@@ -0,0 +1,201 @@
++import { getConversationsAPI } from '../../api/conversation';
++import { MESSAGE_TYPE } from '../../helpers/constants';
++
++const state = {
++  records: [],
++  page: 0,
++  hasNextPage: false,
++  unreadCount: 0,
++  // Bumped whenever another thread takes the screen, so late responses can tell they are stale.
++  thread: 0,
++  // Bumped when setUser switches the visitor, so a list requested for the previous one is dropped.
++  identity: 0,
++  uiFlags: {
++    isFetching: false,
++  },
++};
++
++const findRecord = ($state, id) =>
++  $state.records.find(record => record.id === id);
++
++export const getters = {
++  getRecords: $state => $state.records,
++  getLatestConversation: $state => $state.records[0],
++  getHasNextPage: $state => $state.hasNextPage,
++  getIsFetching: $state => $state.uiFlags.isFetching,
++  // The conversation on screen reports its own unread state from the thread.
++  getUnreadCount: ($state, _getters, rootState) => {
++    const active = findRecord($state, rootState.conversationAttributes.id);
++    return $state.unreadCount - (active?.unread_count > 0 ? 1 : 0);
++  },
++};
++
++export const actions = {
++  fetch: async ({ state: listState, commit }, { page = 1 } = {}) => {
++    const { identity } = listState;
++    commit('setFetching', true);
++    try {
++      const {
++        data: { payload, meta },
++      } = await getConversationsAPI({ page });
++      if (listState.identity !== identity) return;
++      commit('setRecords', {
++        payload,
++        page,
++        hasNextPage: meta.has_next_page,
++        unreadCount: meta.unread_count,
++      });
++    } catch (error) {
++      // Ignore error
++    } finally {
++      if (listState.identity === identity) commit('setFetching', false);
++    }
++  },
++
++  fetchMore: ({ state: listState, dispatch }) => {
++    if (!listState.hasNextPage || listState.uiFlags.isFetching) return;
++    dispatch('fetch', { page: listState.page + 1 });
++  },
++
++  // Records are newest-activity first, so the first match is the most recent one.
++  load: async ({ state: listState, dispatch }) => {
++    await dispatch('startNew');
++    const { thread } = listState;
++    await dispatch('fetch');
++    if (listState.thread !== thread) return;
++    const conversation =
++      listState.records.find(record => record.status !== 'resolved') ||
++      listState.records[0];
++    if (conversation) await dispatch('open', conversation.id);
++  },
++
++  // Reopening the conversation on screen retries its first page when that load failed, offline
++  // for instance; otherwise it would stay empty until a socket reconnect happened to catch up.
++  open: async (
++    { state: listState, commit, dispatch, rootState, rootGetters },
++    id
++  ) => {
++    if (rootState.conversationAttributes.id === id) {
++      if (rootGetters['conversation/getHasLoadFailed']) {
++        await dispatch(
++          'conversation/fetchOldConversations',
++          {},
++          { root: true }
++        );
++      }
++      return;
++    }
++    commit('switchThread');
++    const { thread } = listState;
++    dispatch('conversation/clearConversations', {}, { root: true });
++    await dispatch('attach', id);
++    if (listState.thread !== thread) return;
++    await dispatch('conversation/fetchOldConversations', {}, { root: true });
++  },
++
++  // Points the thread on screen at a conversation, which is also how a new thread takes the
++  // conversation its first message created.
++  attach: async ({ state: listState, commit, dispatch }, id) => {
++    const { thread } = listState;
++    if (!findRecord(listState, id)) {
++      commit(
++        'conversationAttributes/SET_CONVERSATION_ATTRIBUTES',
++        { id },
++        { root: true }
++      );
++      await dispatch('fetch');
++      if (listState.thread !== thread) return;
++    }
++    const record = findRecord(listState, id) || { id };
++    commit('conversationAttributes/SET_CONVERSATION_ATTRIBUTES', record, {
++      root: true,
++    });
++    commit('conversation/setMetaUserLastSeenAt', record.contact_last_seen_at, {
++      root: true,
++    });
++    commit('markRead', id);
++  },
++
++  // A new thread cannot receive its conversation's messages until it knows the id.
++  adopt: async ({ state: listState, dispatch }, id) => {
++    const { thread } = listState;
++    await dispatch('attach', id);
++    if (listState.thread !== thread) return;
++    await dispatch('conversation/syncLatestMessages', {}, { root: true });
++  },
++
++  updateLastMessage: ({ commit }, message) => {
++    commit('setLastMessage', message);
++  },
++
++  // The previous visitor's previews must not stay on screen, nor be restored by a late response.
++  switchIdentity: ({ commit }) => {
++    commit('switchIdentity');
++  },
++
++  startNew: async ({ commit, dispatch }) => {
++    commit('switchThread');
++    await dispatch(
++      'conversationAttributes/clearConversationAttributes',
++      {},
++      { root: true }
++    );
++    await dispatch('conversation/clearConversations', {}, { root: true });
++  },
++};
++
++export const mutations = {
++  setRecords($state, { payload, page, hasNextPage, unreadCount }) {
++    const known = new Set($state.records.map(record => record.id));
++    $state.records =
++      page === 1
++        ? payload
++        : [...$state.records, ...payload.filter(r => !known.has(r.id))];
++    $state.page = page;
++    $state.hasNextPage = hasNextPage;
++    $state.unreadCount = unreadCount;
++  },
++  // Ids only grow, so an older message arriving late cannot replace a newer preview.
++  setLastMessage($state, message) {
++    const record = findRecord($state, message.conversation_id);
++    if (!record || record.last_message?.id > message.id) return;
++    record.last_message = message;
++    record.last_activity_at = message.created_at;
++    if (message.message_type === MESSAGE_TYPE.OUTGOING) {
++      if (!record.unread_count) $state.unreadCount += 1;
++      record.unread_count += 1;
++    }
++    $state.records = [
++      record,
++      ...$state.records.filter(item => item !== record),
++    ];
++  },
++  switchThread($state) {
++    $state.thread += 1;
++  },
++  switchIdentity($state) {
++    $state.identity += 1;
++    $state.records = [];
++    $state.page = 0;
++    $state.hasNextPage = false;
++    $state.unreadCount = 0;
++    $state.uiFlags.isFetching = false;
++  },
++  setFetching($state, isFetching) {
++    $state.uiFlags.isFetching = isFetching;
++  },
++  markRead($state, id) {
++    const record = findRecord($state, id);
++    if (!record?.unread_count) return;
++    record.unread_count = 0;
++    $state.unreadCount -= 1;
++  },
++};
++
++export default {
++  namespaced: true,
++  state,
++  getters,
++  actions,
++  mutations,
++};
+diff --git a/app/javascript/widget/store/modules/specs/campaign/actions.spec.js b/app/javascript/widget/store/modules/specs/campaign/actions.spec.js
+index 793ef6054ed0b28f2ad1a9b75ceef47ad776b989..851a6e0601d1dd5bd468ee1630544df8034513ea 100644
+--- a/app/javascript/widget/store/modules/specs/campaign/actions.spec.js
++++ b/app/javascript/widget/store/modules/specs/campaign/actions.spec.js
+@@ -214,6 +214,7 @@ describe('#actions', () => {
+           'conversation/setConversationUIFlag',
+           {
+             isCreating: true,
++            isAwaitingCampaign: true,
+           },
+           {
+             root: true,
+@@ -241,12 +242,22 @@ describe('#actions', () => {
+           'conversation/setConversationUIFlag',
+           {
+             isCreating: true,
++            isAwaitingCampaign: true,
+           },
+           {
+             root: true,
+           },
+         ],
+         ['setError', true],
++        [
++          'conversation/setConversationUIFlag',
++          {
++            isAwaitingCampaign: false,
++          },
++          {
++            root: true,
++          },
++        ],
+         [
+           'conversation/setConversationUIFlag',
+           {
+diff --git a/app/javascript/widget/store/modules/specs/contact/actions.spec.js b/app/javascript/widget/store/modules/specs/contact/actions.spec.js
+index 9be09ccbf3ab50cb14031fe70c5d0d450ea22752..562f7780d23ddf98f24cdebf608335ac049eb4c4 100644
+--- a/app/javascript/widget/store/modules/specs/contact/actions.spec.js
++++ b/app/javascript/widget/store/modules/specs/contact/actions.spec.js
+@@ -1,5 +1,8 @@
+ import { API } from 'widget/helpers/axios';
+-import { sendMessage } from 'widget/helpers/utils';
++import {
++  sendMessage,
++  isMultipleConversationsEnabled,
++} from 'widget/helpers/utils';
+ import { actions } from '../../contacts';
+ 
+ const commit = vi.fn();
+@@ -8,6 +11,7 @@ const dispatch = vi.fn();
+ vi.mock('widget/helpers/axios');
+ vi.mock('widget/helpers/utils', () => ({
+   sendMessage: vi.fn(),
++  isMultipleConversationsEnabled: vi.fn(() => false),
+ }));
+ 
+ describe('#actions', () => {
+@@ -53,6 +57,22 @@ describe('#actions', () => {
+       ]);
+     });
+ 
++    it('reloads the conversation list when multiple conversations are enabled', async () => {
++      isMultipleConversationsEnabled.mockReturnValueOnce(true);
++      vi.spyOn(API, 'patch').mockResolvedValue({
++        data: { widget_auth_token: 'token' },
++      });
++      await actions.setUser(
++        { commit, dispatch },
++        { identifier: 1, user: { identifier_hash: 'hash' } }
++      );
++      expect(dispatch.mock.calls).toEqual([
++        ['get'],
++        ['conversationList/switchIdentity', {}, { root: true }],
++        ['conversationList/load', {}, { root: true }],
++      ]);
++    });
++
+     it('does not call sendMessage if contact object is not refreshed ', async () => {
+       const user = {
+         email: 'thoma@sphadikam.com',
+diff --git a/app/javascript/widget/store/modules/specs/conversation/actions.spec.js b/app/javascript/widget/store/modules/specs/conversation/actions.spec.js
+index 2ab17cb3793b7cc3d545790dfb07b6002ac31890..35a261d0bb7c98967a55cc96a4302b11279d6e21 100644
+--- a/app/javascript/widget/store/modules/specs/conversation/actions.spec.js
++++ b/app/javascript/widget/store/modules/specs/conversation/actions.spec.js
+@@ -7,6 +7,10 @@ vi.mock('widget/helpers/axios');
+ 
+ const commit = vi.fn();
+ const dispatch = vi.fn();
++const rootState = {
++  conversationAttributes: { id: 1 },
++  conversationList: { thread: 0 },
++};
+ 
+ describe('#actions', () => {
+   describe('#createConversation', () => {
+@@ -32,7 +36,7 @@ describe('#actions', () => {
+         },
+       }));
+       await actions.createConversation(
+-        { commit },
++        { commit, rootState },
+         { contact: {}, message: 'This is a test message' }
+       );
+       expect(commit.mock.calls).toEqual([
+@@ -47,6 +51,41 @@ describe('#actions', () => {
+     });
+   });
+ 
++  describe('#createConversation with multiple conversations', () => {
++    beforeEach(() => {
++      window.chatwootWebChannel = {
++        enabledFeatures: ['multiple_conversations'],
++      };
++      window.WOOT_WIDGET = { $root: { $i18n: { locale: 'en' } } };
++    });
++
++    afterEach(() => {
++      delete window.chatwootWebChannel;
++      delete window.WOOT_WIDGET;
++    });
++
++    it('leaves a thread the visitor already moved away from alone', async () => {
++      const movingRootState = {
++        conversationAttributes: { id: '' },
++        conversationList: { thread: 0 },
++      };
++      API.post.mockImplementationOnce(async () => {
++        movingRootState.conversationList.thread = 1;
++        return { data: { id: 7, messages: [{ id: 1, content: 'hi' }] } };
++      });
++
++      await actions.createConversation(
++        { commit, dispatch, rootState: movingRootState },
++        { message: 'hi' }
++      );
++
++      expect(commit.mock.calls).toEqual([
++        ['setConversationUIFlag', { isCreating: true }],
++      ]);
++      expect(dispatch).not.toBeCalled();
++    });
++  });
++
+   describe('#addOrUpdateMessage', () => {
+     it('sends correct actions for non-deleted message', () => {
+       actions.addOrUpdateMessage(
+@@ -164,7 +203,7 @@ describe('#actions', () => {
+       const state = { pendingCustomAttributes: {}, pendingLabels: [] };
+ 
+       actions.sendAttachment(
+-        { commit, dispatch, state },
++        { commit, dispatch, rootState, state },
+         { attachment, replyTo: 135 }
+       );
+       spy.mockRestore();
+@@ -192,14 +231,19 @@ describe('#actions', () => {
+       API.post.mockResolvedValue({ data: { success: true } });
+       await actions.setUserLastSeen({
+         commit,
++        rootState,
+         getters: { getConversationSize: 2 },
+       });
+       expect(commit.mock.calls[0][0]).toEqual('setMetaUserLastSeenAt');
++      expect(commit).toBeCalledWith('conversationList/markRead', 1, {
++        root: true,
++      });
+     });
+     it('sends correct mutations', async () => {
+       API.post.mockResolvedValue({ data: { success: true } });
+       await actions.setUserLastSeen({
+         commit,
++        rootState,
+         getters: { getConversationSize: 0 },
+       });
+       expect(commit.mock.calls).toEqual([]);
+@@ -265,7 +309,258 @@ describe('#actions', () => {
+     });
+   });
+ 
++  describe('#sendMessageWithData', () => {
++    const message = { id: 'temp-1', content: 'hello', meta: {} };
++    let windowSpy;
++
++    beforeEach(() => {
++      windowSpy = vi.spyOn(window, 'window', 'get');
++      windowSpy.mockImplementation(() => ({
++        WOOT_WIDGET: { $root: { $i18n: { locale: 'en' } } },
++        location: { search: '' },
++        chatwootWebChannel: { enabledFeatures: ['multiple_conversations'] },
++      }));
++    });
++
++    afterEach(() => windowSpy.mockRestore());
++
++    it('adopts the conversation created by the first message', async () => {
++      API.post.mockResolvedValue({ data: { id: 9, conversation_id: 55 } });
++      const draftRootState = {
++        conversationAttributes: { id: '' },
++        conversationList: { thread: 0 },
++      };
++
++      await actions.sendMessageWithData(
++        { commit, dispatch, rootState: draftRootState },
++        { message }
++      );
++
++      expect(commit).toBeCalledWith('pushMessageToConversation', {
++        id: 9,
++        conversation_id: 55,
++        status: 'sent',
++      });
++      expect(dispatch).toBeCalledWith('conversationList/adopt', 55, {
++        root: true,
++      });
++    });
++
++    it('posts messages sent before the first one is saved to the conversation it created', async () => {
++      const draftRootState = {
++        conversationAttributes: { id: '' },
++        conversationList: { thread: 0 },
++      };
++      let saveFirst;
++      API.post
++        .mockImplementationOnce(
++          () =>
++            new Promise(resolve => {
++              saveFirst = () =>
++                resolve({ data: { id: 9, conversation_id: 55 } });
++            })
++        )
++        .mockResolvedValueOnce({ data: { id: 10, conversation_id: 55 } });
++      dispatch.mockImplementation(action => {
++        if (action === 'conversationList/adopt') {
++          draftRootState.conversationAttributes.id = 55;
++        }
++      });
++
++      const first = actions.sendMessageWithData(
++        { commit, dispatch, rootState: draftRootState },
++        { message }
++      );
++      const second = actions.sendMessageWithData(
++        { commit, dispatch, rootState: draftRootState },
++        { message: { id: 'temp-2', content: 'are you there?', meta: {} } }
++      );
++      expect(API.post).toHaveBeenCalledTimes(1);
++      expect(commit).toBeCalledWith('setConversationUIFlag', {
++        isCreating: true,
++      });
++
++      saveFirst();
++      await Promise.all([first, second]);
++
++      expect(API.post).toHaveBeenCalledTimes(2);
++      expect(API.post.mock.calls[0][2]).toEqual({
++        params: { conversation_id: undefined },
++      });
++      expect(API.post.mock.calls[1][2]).toEqual({
++        params: { conversation_id: 55 },
++      });
++      expect(commit).toBeCalledWith('setConversationUIFlag', {
++        isCreating: false,
++      });
++      expect(commit).toBeCalledWith('pushMessageToConversation', {
++        id: 10,
++        conversation_id: 55,
++        status: 'sent',
++      });
++      expect(dispatch).toHaveBeenCalledTimes(1);
++    });
++
++    it('does not let a later draft join the first draft that is still being saved', async () => {
++      const draftRootState = {
++        conversationAttributes: { id: '' },
++        conversationList: { thread: 0 },
++      };
++      let saveFirst;
++      API.post
++        .mockImplementationOnce(
++          () =>
++            new Promise(resolve => {
++              saveFirst = () =>
++                resolve({ data: { id: 9, conversation_id: 55 } });
++            })
++        )
++        .mockResolvedValueOnce({ data: { id: 10, conversation_id: 56 } });
++
++      const first = actions.sendMessageWithData(
++        { commit, dispatch, rootState: draftRootState },
++        { message }
++      );
++      draftRootState.conversationList.thread = 1;
++      const second = actions.sendMessageWithData(
++        { commit, dispatch, rootState: draftRootState },
++        { message: { id: 'temp-2', content: 'another question', meta: {} } }
++      );
++
++      expect(API.post).toHaveBeenCalledTimes(2);
++      expect(API.post.mock.calls[1][2]).toEqual({
++        params: { conversation_id: undefined },
++      });
++      saveFirst();
++      await Promise.all([first, second]);
++      expect(commit).toBeCalledWith('deleteMessage', 'temp-1');
++      expect(dispatch).toBeCalledWith('conversationList/adopt', 56, {
++        root: true,
++      });
++      expect(dispatch).not.toBeCalledWith('conversationList/adopt', 55, {
++        root: true,
++      });
++    });
++
++    it('fails the waiting messages when the first one could not be saved', async () => {
++      const draftRootState = {
++        conversationAttributes: { id: '' },
++        conversationList: { thread: 0 },
++      };
++      API.post.mockRejectedValueOnce(new Error('offline'));
++      const waiting = { id: 'temp-2', content: 'are you there?', meta: {} };
++
++      await Promise.all([
++        actions.sendMessageWithData(
++          { commit, dispatch, rootState: draftRootState },
++          { message }
++        ),
++        actions.sendMessageWithData(
++          { commit, dispatch, rootState: draftRootState },
++          { message: waiting }
++        ),
++      ]);
++
++      expect(API.post).toHaveBeenCalledTimes(1);
++      expect(commit).toBeCalledWith('pushMessageToConversation', {
++        ...waiting,
++        status: 'failed',
++      });
++    });
++
++    it('replaces a retried message instead of leaving its failed copy behind', async () => {
++      API.post.mockResolvedValue({
++        data: { id: 9, content: 'hello', message_type: 0, conversation_id: 1 },
++      });
++
++      await actions.sendMessageWithData(
++        { commit, dispatch, rootState },
++        { message: { ...message, message_type: 0, status: 'failed' } }
++      );
++
++      expect(commit.mock.calls[0]).toEqual([
++        'pushMessageToConversation',
++        { ...message, message_type: 0, status: 'in_progress' },
++      ]);
++    });
++
++    it('drops the reply when the visitor moved to another conversation meanwhile', async () => {
++      const movingRootState = {
++        conversationAttributes: { id: 1 },
++        conversationList: { thread: 0 },
++      };
++      API.post.mockImplementationOnce(async () => {
++        movingRootState.conversationList.thread = 1;
++        return { data: { id: 9, conversation_id: 1 } };
++      });
++
++      await actions.sendMessageWithData(
++        { commit, dispatch, rootState: movingRootState },
++        { message }
++      );
++
++      expect(commit).toBeCalledWith('deleteMessage', 'temp-1');
++      expect(commit).not.toBeCalledWith('pushMessageToConversation', {
++        id: 9,
++        conversation_id: 1,
++        status: 'sent',
++      });
++    });
++
++    it('keeps the reply in the thread with multiple conversations disabled', async () => {
++      windowSpy.mockImplementation(() => ({
++        WOOT_WIDGET: { $root: { $i18n: { locale: 'en' } } },
++        location: { search: '' },
++      }));
++      const movingRootState = {
++        conversationAttributes: { id: 1 },
++        conversationList: { thread: 0 },
++      };
++      API.post.mockImplementationOnce(async () => {
++        movingRootState.conversationList.thread = 1;
++        return { data: { id: 9, conversation_id: 1 } };
++      });
++
++      await actions.sendMessageWithData(
++        { commit, dispatch, rootState: movingRootState },
++        { message }
++      );
++
++      expect(commit).toBeCalledWith('pushMessageToConversation', {
++        id: 9,
++        conversation_id: 1,
++        status: 'sent',
++      });
++      expect(dispatch).not.toBeCalled();
++    });
++  });
++
+   describe('#fetchOldConversations', () => {
++    it('ignores a page that arrives after moving to another conversation', async () => {
++      window.chatwootWebChannel = {
++        enabledFeatures: ['multiple_conversations'],
++      };
++      const movingRootState = {
++        conversationAttributes: { id: 1 },
++        conversationList: { thread: 0 },
++      };
++      API.get.mockImplementationOnce(async () => {
++        movingRootState.conversationList.thread = 1;
++        return { data: { payload: [{ id: 1 }], meta: {} } };
++      });
++
++      await actions.fetchOldConversations(
++        { commit, rootState: movingRootState },
++        {}
++      );
++
++      expect(commit.mock.calls).toEqual([
++        ['setConversationListLoading', true],
++        ['setConversationListLoading', false],
++      ]);
++      delete window.chatwootWebChannel;
++    });
++
+     it('sends correct actions', async () => {
+       API.get.mockResolvedValue({
+         data: {
+@@ -286,7 +581,7 @@ describe('#actions', () => {
+           },
+         },
+       });
+-      await actions.fetchOldConversations({ commit }, {});
++      await actions.fetchOldConversations({ commit, rootState }, {});
+       expect(commit.mock.calls).toEqual([
+         ['setConversationListLoading', true],
+         ['conversation/setMetaUserLastSeenAt', 1466424490, { root: true }],
+@@ -300,6 +595,26 @@ describe('#actions', () => {
+             },
+           ],
+         ],
++        ['setConversationUIFlag', { hasLoadFailed: false }],
++        ['setConversationListLoading', false],
++      ]);
++    });
++
++    it('flags a failed first page so reopening the conversation retries it', async () => {
++      API.get.mockRejectedValue(new Error('Network Error'));
++      await actions.fetchOldConversations({ commit, rootState }, {});
++      expect(commit.mock.calls).toEqual([
++        ['setConversationListLoading', true],
++        ['setConversationUIFlag', { hasLoadFailed: true }],
++        ['setConversationListLoading', false],
++      ]);
++    });
++
++    it('leaves the flag alone when an older page fails', async () => {
++      API.get.mockRejectedValue(new Error('Network Error'));
++      await actions.fetchOldConversations({ commit, rootState }, { before: 5 });
++      expect(commit.mock.calls).toEqual([
++        ['setConversationListLoading', true],
+         ['setConversationListLoading', false],
+       ]);
+     });
+@@ -349,7 +664,7 @@ describe('#actions', () => {
+           },
+         },
+       });
+-      await actions.syncLatestMessages({ state, commit }, {});
++      await actions.syncLatestMessages({ state, commit, rootState }, {});
+       expect(commit.mock.calls).toEqual([
+         ['conversation/setMetaUserLastSeenAt', 1466424490, { root: true }],
+         [
+@@ -431,7 +746,7 @@ describe('#actions', () => {
+           },
+         },
+       });
+-      await actions.syncLatestMessages({ state, commit }, {});
++      await actions.syncLatestMessages({ state, commit, rootState }, {});
+ 
+       expect(commit.mock.calls).toEqual([
+         ['conversation/setMetaUserLastSeenAt', 14664223490, { root: true }],
+@@ -504,7 +819,7 @@ describe('#actions', () => {
+           },
+         },
+       });
+-      await actions.syncLatestMessages({ state, commit }, {});
++      await actions.syncLatestMessages({ state, commit, rootState }, {});
+ 
+       expect(commit.mock.calls).toEqual([]);
+     });
+diff --git a/app/javascript/widget/store/modules/specs/conversation/helpers.spec.js b/app/javascript/widget/store/modules/specs/conversation/helpers.spec.js
+index 46cbd34defeaa8e18fb53e258ea15a2aab0d9935..925d4f0ca278f85c9b4fce06c7d01979f15e2e65 100644
+--- a/app/javascript/widget/store/modules/specs/conversation/helpers.spec.js
++++ b/app/javascript/widget/store/modules/specs/conversation/helpers.spec.js
+@@ -3,6 +3,7 @@ import {
+   createTemporaryMessage,
+   getNonDeletedMessages,
+   groupConversationBySender,
++  hasLeftConversation,
+ } from '../../conversation/helpers';
+ 
+ describe('#findUndeliveredMessage', () => {
+@@ -101,3 +102,21 @@ describe('#groupConversationBySender', () => {
+     ).toEqual([true, true]);
+   });
+ });
++
++describe('#hasLeftConversation', () => {
++  afterEach(() => {
++    delete window.chatwootWebChannel;
++  });
++
++  it('is true when another thread took the screen with multiple conversations enabled', () => {
++    window.chatwootWebChannel = { enabledFeatures: ['multiple_conversations'] };
++    const rootState = { conversationList: { thread: 2 } };
++    expect(hasLeftConversation(rootState, 1)).toBe(true);
++    expect(hasLeftConversation(rootState, 2)).toBe(false);
++  });
++
++  it('is false with multiple conversations disabled', () => {
++    const rootState = { conversationList: { thread: 2 } };
++    expect(hasLeftConversation(rootState, 1)).toBe(false);
++  });
++});
+diff --git a/app/javascript/widget/store/modules/specs/conversation/mutations.spec.js b/app/javascript/widget/store/modules/specs/conversation/mutations.spec.js
+index 0894c5b523d86dd39ccbf8bbba74e3a82cf5b094..5180da4e8e9ad0333389321ff2cf3b08e73e6bc3 100644
+--- a/app/javascript/widget/store/modules/specs/conversation/mutations.spec.js
++++ b/app/javascript/widget/store/modules/specs/conversation/mutations.spec.js
+@@ -169,14 +169,28 @@ describe('#mutations', () => {
+   });
+ 
+   describe('#clearConversations', () => {
+-    it('clears conversations and pending metadata', () => {
++    it('clears conversations, the typing indicator and pending metadata', () => {
+       const state = {
+         conversations: { 1: { id: 1 } },
++        lastMessageId: 1,
++        uiFlags: {
++          allMessagesLoaded: true,
++          isAgentTyping: true,
++          isCreating: true,
++          isAwaitingCampaign: true,
++          hasLoadFailed: true,
++        },
+         pendingCustomAttributes: { plan: 'enterprise' },
+         pendingLabels: ['vip'],
+       };
+       mutations.clearConversations(state);
+       expect(state.conversations).toEqual({});
++      expect(state.lastMessageId).toBe(null);
++      expect(state.uiFlags.allMessagesLoaded).toBe(false);
++      expect(state.uiFlags.isAgentTyping).toBe(false);
++      expect(state.uiFlags.isCreating).toBe(false);
++      expect(state.uiFlags.isAwaitingCampaign).toBe(false);
++      expect(state.uiFlags.hasLoadFailed).toBe(false);
+       expect(state.pendingCustomAttributes).toEqual({});
+       expect(state.pendingLabels).toEqual([]);
+     });
+diff --git a/app/javascript/widget/store/modules/specs/conversationAttributes/actions.spec.js b/app/javascript/widget/store/modules/specs/conversationAttributes/actions.spec.js
+index af4072c4f4d57b1d2de5112fdba77f8327722bd8..a06a923dafc2d8b07471d2d4e3a576a05b3d225e 100644
+--- a/app/javascript/widget/store/modules/specs/conversationAttributes/actions.spec.js
++++ b/app/javascript/widget/store/modules/specs/conversationAttributes/actions.spec.js
+@@ -1,5 +1,5 @@
+-import { actions } from '../../conversationAttributes';
+ import { API } from 'widget/helpers/axios';
++import { actions } from '../../conversationAttributes';
+ 
+ const commit = vi.fn();
+ vi.mock('widget/helpers/axios');
+@@ -8,15 +8,24 @@ describe('#actions', () => {
+   describe('#get attributes', () => {
+     it('sends mutation if api is success', async () => {
+       API.get.mockResolvedValue({ data: { id: 1, status: 'pending' } });
+-      await actions.getAttributes({ commit });
++      await actions.getAttributes({ commit, state: { id: '' } });
+       expect(commit.mock.calls).toEqual([
+         ['SET_CONVERSATION_ATTRIBUTES', { id: 1, status: 'pending' }],
+         ['conversation/setMetaUserLastSeenAt', undefined, { root: true }],
+       ]);
+     });
++    it('ignores a response for another conversation when multiple conversations are enabled', async () => {
++      window.chatwootWebChannel = {
++        enabledFeatures: ['multiple_conversations'],
++      };
++      API.get.mockResolvedValue({ data: { id: 2, status: 'open' } });
++      await actions.getAttributes({ commit, state: { id: 1 } });
++      expect(commit.mock.calls).toEqual([]);
++      delete window.chatwootWebChannel;
++    });
+     it('doesnot send mutation if api is error', async () => {
+       API.get.mockRejectedValue({ message: 'Invalid Headers' });
+-      await actions.getAttributes({ commit });
++      await actions.getAttributes({ commit, state: { id: '' } });
+       expect(commit.mock.calls).toEqual([]);
+     });
+   });
+diff --git a/app/javascript/widget/store/modules/specs/conversationAttributes/mutations.spec.js b/app/javascript/widget/store/modules/specs/conversationAttributes/mutations.spec.js
+index ede3c3a8fd71aad30b0a5755dec5b4ae20107705..ecd6ec23adf842b5a60020d4f0ba8930564f80a6 100644
+--- a/app/javascript/widget/store/modules/specs/conversationAttributes/mutations.spec.js
++++ b/app/javascript/widget/store/modules/specs/conversationAttributes/mutations.spec.js
+@@ -1,4 +1,7 @@
+ import { mutations } from '../../conversationAttributes';
++import { setActiveConversationId } from 'widget/helpers/axios';
++
++vi.mock('widget/helpers/axios');
+ 
+ describe('#mutations', () => {
+   describe('#SET_CONVERSATION_ATTRIBUTES', () => {
+@@ -9,6 +12,7 @@ describe('#mutations', () => {
+         status: 'open',
+       });
+       expect(state).toEqual({ id: 1, status: 'open' });
++      expect(setActiveConversationId).toBeCalledWith(1);
+     });
+   });
+ 
+@@ -39,6 +43,7 @@ describe('#mutations', () => {
+         status: 'open',
+       });
+       expect(state).toEqual({ id: '', status: '' });
++      expect(setActiveConversationId).toBeCalledWith(null);
+     });
+   });
+ });
+diff --git a/app/javascript/widget/store/modules/specs/conversationList/actions.spec.js b/app/javascript/widget/store/modules/specs/conversationList/actions.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7077155901f374cdf7c511b3b11968c127d13d6
+--- /dev/null
++++ b/app/javascript/widget/store/modules/specs/conversationList/actions.spec.js
+@@ -0,0 +1,295 @@
++import { actions } from '../../conversationList';
++import { API } from 'widget/helpers/axios';
++
++vi.mock('widget/helpers/axios');
++
++const commit = vi.fn();
++const dispatch = vi.fn();
++
++const records = [
++  { id: 3, status: 'resolved', contact_last_seen_at: 30, unread_count: 0 },
++  { id: 2, status: 'open', contact_last_seen_at: 20, unread_count: 2 },
++];
++
++describe('#actions', () => {
++  describe('#fetch', () => {
++    it('stores the page returned by the API', async () => {
++      API.get.mockResolvedValue({
++        data: {
++          payload: records,
++          meta: { has_next_page: true, unread_count: 1 },
++        },
++      });
++      await actions.fetch({ state: { identity: 0 }, commit });
++      expect(commit.mock.calls).toEqual([
++        ['setFetching', true],
++        [
++          'setRecords',
++          { payload: records, page: 1, hasNextPage: true, unreadCount: 1 },
++        ],
++        ['setFetching', false],
++      ]);
++    });
++
++    it('clears the loading flag when the API fails', async () => {
++      API.get.mockRejectedValue(new Error('offline'));
++      await actions.fetch({ state: { identity: 0 }, commit });
++      expect(commit.mock.calls).toEqual([
++        ['setFetching', true],
++        ['setFetching', false],
++      ]);
++    });
++
++    it('drops a response requested before setUser switched the visitor', async () => {
++      const state = { identity: 0 };
++      API.get.mockImplementation(async () => {
++        state.identity += 1;
++        return {
++          data: {
++            payload: records,
++            meta: { has_next_page: false, unread_count: 1 },
++          },
++        };
++      });
++      await actions.fetch({ state, commit });
++      expect(commit.mock.calls).toEqual([['setFetching', true]]);
++    });
++  });
++
++  describe('#fetchMore', () => {
++    it('requests the next page', () => {
++      actions.fetchMore({
++        dispatch,
++        state: { page: 1, hasNextPage: true, uiFlags: { isFetching: false } },
++      });
++      expect(dispatch).toBeCalledWith('fetch', { page: 2 });
++    });
++
++    it('does nothing when there is no next page or a fetch is running', () => {
++      actions.fetchMore({
++        dispatch,
++        state: { page: 1, hasNextPage: false, uiFlags: { isFetching: false } },
++      });
++      actions.fetchMore({
++        dispatch,
++        state: { page: 1, hasNextPage: true, uiFlags: { isFetching: true } },
++      });
++      expect(dispatch).not.toBeCalled();
++    });
++  });
++
++  describe('#load', () => {
++    it('opens the most recent conversation that is not resolved', async () => {
++      const state = { records };
++      await actions.load({ state, dispatch });
++      expect(dispatch.mock.calls).toEqual([
++        ['startNew'],
++        ['fetch'],
++        ['open', 2],
++      ]);
++    });
++
++    it('stays on the most recent open conversation when an older one has unread messages', async () => {
++      const state = {
++        records: [
++          { id: 4, status: 'open', unread_count: 0 },
++          { id: 3, status: 'resolved', unread_count: 2 },
++          { id: 2, status: 'open', unread_count: 1 },
++        ],
++      };
++      await actions.load({ state, dispatch });
++      expect(dispatch).toBeCalledWith('open', 4);
++      expect(dispatch).not.toBeCalledWith('open', 3);
++    });
++
++    it('falls back to the most recent conversation when all are resolved', async () => {
++      const state = { records: [records[0]] };
++      await actions.load({ state, dispatch });
++      expect(dispatch).toBeCalledWith('open', 3);
++    });
++
++    it('opens nothing for a visitor without conversations', async () => {
++      await actions.load({ state: { records: [] }, dispatch });
++      expect(dispatch.mock.calls).toEqual([['startNew'], ['fetch']]);
++    });
++
++    it('opens nothing when the visitor switched threads while the list loaded', async () => {
++      const state = { records, thread: 1 };
++      dispatch.mockImplementation(async action => {
++        if (action === 'fetch') state.thread += 1;
++      });
++
++      await actions.load({ state, dispatch });
++
++      expect(dispatch).not.toBeCalledWith('open', 2);
++    });
++  });
++
++  describe('#open', () => {
++    it('clears the thread on screen, attaches the selected conversation and loads it', async () => {
++      const rootState = { conversationAttributes: { id: '' } };
++      await actions.open(
++        { state: { thread: 1 }, commit, dispatch, rootState },
++        2
++      );
++
++      expect(commit.mock.calls).toEqual([['switchThread']]);
++      expect(dispatch.mock.calls).toEqual([
++        ['conversation/clearConversations', {}, { root: true }],
++        ['attach', 2],
++        ['conversation/fetchOldConversations', {}, { root: true }],
++      ]);
++    });
++
++    it('skips loading messages when another thread took the screen meanwhile', async () => {
++      const state = { thread: 1 };
++      const rootState = { conversationAttributes: { id: '' } };
++      dispatch.mockImplementation(async action => {
++        if (action === 'attach') state.thread += 1;
++      });
++
++      await actions.open({ state, commit, dispatch, rootState }, 2);
++
++      expect(dispatch).not.toBeCalledWith(
++        'conversation/fetchOldConversations',
++        {},
++        { root: true }
++      );
++    });
++
++    it('does nothing when the conversation is already open', async () => {
++      const rootState = { conversationAttributes: { id: 2 } };
++      const rootGetters = { 'conversation/getHasLoadFailed': false };
++      await actions.open(
++        { state: {}, commit, dispatch, rootState, rootGetters },
++        2
++      );
++      expect(commit).not.toBeCalled();
++      expect(dispatch).not.toBeCalled();
++    });
++
++    it('retries the first page of the open conversation when it failed to load', async () => {
++      const rootState = { conversationAttributes: { id: 2 } };
++      const rootGetters = { 'conversation/getHasLoadFailed': true };
++      await actions.open(
++        { state: {}, commit, dispatch, rootState, rootGetters },
++        2
++      );
++      expect(commit).not.toBeCalled();
++      expect(dispatch.mock.calls).toEqual([
++        ['conversation/fetchOldConversations', {}, { root: true }],
++      ]);
++    });
++  });
++
++  describe('#attach', () => {
++    it('shows the conversation in the thread on screen', async () => {
++      await actions.attach({ state: { records }, commit, dispatch }, 2);
++
++      expect(commit.mock.calls).toEqual([
++        [
++          'conversationAttributes/SET_CONVERSATION_ATTRIBUTES',
++          records[1],
++          { root: true },
++        ],
++        ['conversation/setMetaUserLastSeenAt', 20, { root: true }],
++        ['markRead', 2],
++      ]);
++      expect(dispatch).not.toBeCalled();
++    });
++
++    it('refreshes the list before attaching a conversation it does not know yet', async () => {
++      const state = { records: [] };
++      dispatch.mockImplementation(async action => {
++        if (action === 'fetch') state.records = records;
++      });
++
++      await actions.attach({ state, commit, dispatch }, 2);
++
++      expect(commit.mock.calls[0]).toEqual([
++        'conversationAttributes/SET_CONVERSATION_ATTRIBUTES',
++        { id: 2 },
++        { root: true },
++      ]);
++      expect(dispatch).toBeCalledWith('fetch');
++      expect(commit).toBeCalledWith(
++        'conversationAttributes/SET_CONVERSATION_ATTRIBUTES',
++        records[1],
++        { root: true }
++      );
++    });
++
++    it('stops when another thread took the screen while the list loaded', async () => {
++      const state = { records: [], thread: 1 };
++      dispatch.mockImplementation(async action => {
++        if (action === 'fetch') {
++          state.records = records;
++          state.thread += 1;
++        }
++      });
++
++      await actions.attach({ state, commit, dispatch }, 2);
++
++      expect(commit.mock.calls).toEqual([
++        [
++          'conversationAttributes/SET_CONVERSATION_ATTRIBUTES',
++          { id: 2 },
++          { root: true },
++        ],
++      ]);
++      expect(dispatch.mock.calls).toEqual([['fetch']]);
++    });
++  });
++
++  describe('#adopt', () => {
++    it('attaches the conversation and catches up on the messages it missed', async () => {
++      await actions.adopt({ state: { thread: 1 }, dispatch }, 2);
++
++      expect(dispatch.mock.calls).toEqual([
++        ['attach', 2],
++        ['conversation/syncLatestMessages', {}, { root: true }],
++      ]);
++    });
++
++    it('skips catching up when another thread took the screen meanwhile', async () => {
++      const state = { thread: 1 };
++      dispatch.mockImplementation(async () => {
++        state.thread += 1;
++      });
++
++      await actions.adopt({ state, dispatch }, 2);
++
++      expect(dispatch.mock.calls).toEqual([['attach', 2]]);
++    });
++  });
++
++  describe('#updateLastMessage', () => {
++    it('updates the row of the message conversation', () => {
++      const message = { id: 40, conversation_id: 2 };
++      actions.updateLastMessage({ commit }, message);
++      expect(commit).toBeCalledWith('setLastMessage', message);
++    });
++  });
++
++  describe('#switchIdentity', () => {
++    it('forgets the previous visitor list', () => {
++      actions.switchIdentity({ commit });
++      expect(commit.mock.calls).toEqual([['switchIdentity']]);
++    });
++  });
++
++  describe('#startNew', () => {
++    it('clears the active conversation and its thread', async () => {
++      await actions.startNew({ commit, dispatch });
++      expect(commit.mock.calls).toEqual([['switchThread']]);
++      expect(dispatch.mock.calls).toEqual([
++        [
++          'conversationAttributes/clearConversationAttributes',
++          {},
++          { root: true },
++        ],
++        ['conversation/clearConversations', {}, { root: true }],
++      ]);
++    });
++  });
++});
+diff --git a/app/javascript/widget/store/modules/specs/conversationList/getters.spec.js b/app/javascript/widget/store/modules/specs/conversationList/getters.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d21c6aa9d980b3bfd72be7986594c40b2cd9615e
+--- /dev/null
++++ b/app/javascript/widget/store/modules/specs/conversationList/getters.spec.js
+@@ -0,0 +1,25 @@
++import { getters } from '../../conversationList';
++
++const records = [
++  { id: 4, status: 'resolved', unread_count: 1 },
++  { id: 3, status: 'open', unread_count: 2 },
++  { id: 2, status: 'pending', unread_count: 3 },
++  { id: 1, status: 'resolved', unread_count: 0 },
++];
++
++describe('#getters', () => {
++  it('returns the most recent conversation', () => {
++    expect(getters.getLatestConversation({ records })).toEqual(records[0]);
++    expect(getters.getLatestConversation({ records: [] })).toBe(undefined);
++  });
++
++  it('counts unread conversations, leaving the one on screen to the thread', () => {
++    const state = { records, unreadCount: 3 };
++    expect(
++      getters.getUnreadCount(state, {}, { conversationAttributes: { id: 3 } })
++    ).toBe(2);
++    expect(
++      getters.getUnreadCount(state, {}, { conversationAttributes: { id: 1 } })
++    ).toBe(3);
++  });
++});
+diff --git a/app/javascript/widget/store/modules/specs/conversationList/identity.spec.js b/app/javascript/widget/store/modules/specs/conversationList/identity.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c271bf9a992beb15eb8b6b828a4021503663cab
+--- /dev/null
++++ b/app/javascript/widget/store/modules/specs/conversationList/identity.spec.js
+@@ -0,0 +1,116 @@
++import { createStore } from 'vuex';
++import { API } from 'widget/helpers/axios';
++import contacts from '../../contacts';
++import conversationList from '../../conversationList';
++
++vi.mock('widget/helpers/axios');
++
++const deferred = () => {
++  let resolve;
++  const promise = new Promise(done => {
++    resolve = done;
++  });
++  return { promise, resolve };
++};
++
++const flushPromises = () =>
++  new Promise(resolve => {
++    setTimeout(resolve, 0);
++  });
++
++const listResponse = payload => ({
++  data: { payload, meta: { has_next_page: false, unread_count: 0 } },
++});
++
++const buildStore = () =>
++  createStore({
++    modules: {
++      contacts,
++      conversationList: {
++        ...conversationList,
++        state: structuredClone(conversationList.state),
++      },
++      conversationAttributes: {
++        namespaced: true,
++        state: { id: '' },
++        actions: { clearConversationAttributes: () => {} },
++        mutations: { SET_CONVERSATION_ATTRIBUTES: () => {} },
++      },
++      conversation: {
++        namespaced: true,
++        actions: {
++          clearConversations: () => {},
++          fetchOldConversations: () => {},
++        },
++        mutations: { setMetaUserLastSeenAt: () => {} },
++      },
++    },
++  });
++
++describe('conversation list across a setUser identity switch', () => {
++  beforeEach(() => {
++    window.chatwootWebChannel = { enabledFeatures: ['multiple_conversations'] };
++  });
++
++  afterEach(() => {
++    delete window.chatwootWebChannel;
++  });
++
++  it('never shows the previous visitor list when its response arrives last', async () => {
++    const previousVisitorList = deferred();
++    const currentVisitorList = deferred();
++    const lists = [previousVisitorList.promise, currentVisitorList.promise];
++    API.get.mockImplementation(url =>
++      url.includes('/conversations/list')
++        ? lists.shift()
++        : Promise.resolve({ data: {} })
++    );
++    API.patch.mockResolvedValue({ data: { widget_auth_token: 'token-b' } });
++    const store = buildStore();
++
++    const staleFetch = store.dispatch('conversationList/fetch');
++    await store.dispatch('contacts/setUser', {
++      identifier: 'visitor-b',
++      user: { identifier_hash: 'hash-b' },
++    });
++
++    currentVisitorList.resolve(
++      listResponse([{ id: 20, status: 'open', unread_count: 0 }])
++    );
++    await flushPromises();
++    previousVisitorList.resolve(
++      listResponse([{ id: 10, status: 'open', unread_count: 3 }])
++    );
++    await staleFetch;
++    await flushPromises();
++
++    const ids = store.getters['conversationList/getRecords'].map(
++      record => record.id
++    );
++    expect(ids).toEqual([20]);
++    expect(store.getters['conversationList/getIsFetching']).toBe(false);
++  });
++
++  it('drops the previous visitor list as soon as the identity changes', async () => {
++    API.get.mockImplementation(url =>
++      url.includes('/conversations/list')
++        ? new Promise(() => {})
++        : Promise.resolve({ data: {} })
++    );
++    API.patch.mockResolvedValue({ data: { widget_auth_token: 'token-b' } });
++    const store = buildStore();
++    store.commit('conversationList/setRecords', {
++      payload: [{ id: 10, status: 'open', unread_count: 3 }],
++      page: 1,
++      hasNextPage: false,
++      unreadCount: 1,
++    });
++
++    await store.dispatch('contacts/setUser', {
++      identifier: 'visitor-b',
++      user: { identifier_hash: 'hash-b' },
++    });
++
++    expect(store.getters['conversationList/getRecords']).toEqual([]);
++  });
++});
+diff --git a/app/javascript/widget/store/modules/specs/conversationList/mutations.spec.js b/app/javascript/widget/store/modules/specs/conversationList/mutations.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..90c2a82a82b645918929aacca1fa9ba503c8d271
+--- /dev/null
++++ b/app/javascript/widget/store/modules/specs/conversationList/mutations.spec.js
+@@ -0,0 +1,126 @@
++import { mutations } from '../../conversationList';
++
++describe('#mutations', () => {
++  describe('#setRecords', () => {
++    it('replaces the list with the first page', () => {
++      const state = {
++        records: [{ id: 9 }],
++        page: 2,
++        hasNextPage: true,
++        unreadCount: 0,
++      };
++      mutations.setRecords(state, {
++        payload: [{ id: 2 }, { id: 1 }],
++        page: 1,
++        hasNextPage: false,
++        unreadCount: 1,
++      });
++      expect(state).toEqual({
++        records: [{ id: 2 }, { id: 1 }],
++        page: 1,
++        hasNextPage: false,
++        unreadCount: 1,
++      });
++    });
++
++    it('appends later pages without repeating conversations already listed', () => {
++      const state = { records: [{ id: 3 }, { id: 2 }], page: 1 };
++      mutations.setRecords(state, {
++        payload: [{ id: 2 }, { id: 1 }],
++        page: 2,
++        hasNextPage: false,
++      });
++      expect(state.records).toEqual([{ id: 3 }, { id: 2 }, { id: 1 }]);
++      expect(state.page).toBe(2);
++    });
++  });
++
++  describe('#setLastMessage', () => {
++    it('shows the message on its row and moves the row to the top', () => {
++      const state = {
++        records: [
++          { id: 3, last_message: { id: 30 } },
++          { id: 2, last_message: { id: 20 }, last_activity_at: 1 },
++        ],
++      };
++      mutations.setLastMessage(state, {
++        id: 40,
++        conversation_id: 2,
++        created_at: 9,
++      });
++      expect(state.records.map(record => record.id)).toEqual([2, 3]);
++      expect(state.records[0].last_message.id).toBe(40);
++      expect(state.records[0].last_activity_at).toBe(9);
++    });
++
++    it('counts an agent reply as unread for its conversation', () => {
++      const state = {
++        records: [{ id: 2, last_message: { id: 20 }, unread_count: 0 }],
++        unreadCount: 0,
++      };
++      mutations.setLastMessage(state, {
++        id: 40,
++        conversation_id: 2,
++        message_type: 1,
++      });
++      expect(state.records[0].unread_count).toBe(1);
++      expect(state.unreadCount).toBe(1);
++    });
++
++    it('keeps a newer preview and ignores unknown conversations', () => {
++      const state = { records: [{ id: 2, last_message: { id: 40 } }] };
++      mutations.setLastMessage(state, { id: 30, conversation_id: 2 });
++      mutations.setLastMessage(state, { id: 50, conversation_id: 9 });
++      expect(state.records).toEqual([{ id: 2, last_message: { id: 40 } }]);
++    });
++  });
++
++  describe('#switchThread', () => {
++    it('moves to the next thread', () => {
++      const state = { thread: 1 };
++      mutations.switchThread(state);
++      expect(state.thread).toBe(2);
++    });
++  });
++
++  describe('#switchIdentity', () => {
++    it('moves to the next identity and forgets the previous visitor list', () => {
++      const state = {
++        identity: 1,
++        records: [{ id: 1, unread_count: 4 }],
++        page: 2,
++        hasNextPage: true,
++        unreadCount: 1,
++        uiFlags: { isFetching: true },
++      };
++      mutations.switchIdentity(state);
++      expect(state).toEqual({
++        identity: 2,
++        records: [],
++        page: 0,
++        hasNextPage: false,
++        unreadCount: 0,
++        uiFlags: { isFetching: false },
++      });
++    });
++  });
++
++  describe('#markRead', () => {
++    it('clears the conversation and drops it from the unread total once', () => {
++      const state = { records: [{ id: 1, unread_count: 4 }], unreadCount: 2 };
++      mutations.markRead(state, 1);
++      mutations.markRead(state, 1);
++      mutations.markRead(state, 2);
++      expect(state.records).toEqual([{ id: 1, unread_count: 0 }]);
++      expect(state.unreadCount).toBe(1);
++    });
++  });
++
++  describe('#setFetching', () => {
++    it('sets the loading flag', () => {
++      const state = { uiFlags: { isFetching: false } };
++      mutations.setFetching(state, true);
++      expect(state.uiFlags.isFetching).toBe(true);
++    });
++  });
++});
+diff --git a/app/javascript/widget/store/modules/specs/conversationList/reconnect.spec.js b/app/javascript/widget/store/modules/specs/conversationList/reconnect.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..a97a9169eae1ed445396b34c5885c52a95f3fcf8
+--- /dev/null
++++ b/app/javascript/widget/store/modules/specs/conversationList/reconnect.spec.js
+@@ -0,0 +1,113 @@
++import { createStore } from 'vuex';
++import { API } from 'widget/helpers/axios';
++import conversation from '../../conversation';
++import conversationAttributes from '../../conversationAttributes';
++import conversationList from '../../conversationList';
++
++vi.mock('widget/helpers/axios');
++
++const fresh = module => ({ ...module, state: structuredClone(module.state) });
++
++const buildStore = () =>
++  createStore({
++    modules: {
++      conversation: fresh(conversation),
++      conversationAttributes: fresh(conversationAttributes),
++      conversationList: fresh(conversationList),
++    },
++  });
++
++// Conversation 1 is on screen with message 100; conversation 2 is older and holds message 50.
++const olderMessage = {
++  id: 50,
++  conversation_id: 2,
++  created_at: 5,
++  content: 'Bonjour',
++};
++
++const isMessagesRequest = url => url.startsWith('/api/v1/widget/messages');
++
++// Like the server: `after` returns only newer messages of the requested conversation.
++const serveOlderConversation = (url, { params } = {}) => {
++  if (!isMessagesRequest(url)) return new Promise(() => {});
++  const payload = params?.after >= olderMessage.id ? [] : [olderMessage];
++  return Promise.resolve({ data: { payload, meta: {} } });
++};
++
++const goOffline = () =>
++  API.get.mockImplementation(url =>
++    isMessagesRequest(url)
++      ? Promise.reject(new Error('Network Error'))
++      : new Promise(() => {})
++  );
++
++const shownMessageIds = store =>
++  Object.keys(store.getters['conversation/getConversation']).map(Number);
++
++describe('switching conversations while offline', () => {
++  let store;
++
++  beforeEach(() => {
++    window.chatwootWebChannel = { enabledFeatures: ['multiple_conversations'] };
++    store = buildStore();
++    store.commit('conversationList/setRecords', {
++      payload: [
++        { id: 1, status: 'open', unread_count: 0 },
++        { id: 2, status: 'open', unread_count: 0 },
++      ],
++      page: 1,
++      hasNextPage: false,
++      unreadCount: 0,
++    });
++    store.commit('conversationAttributes/SET_CONVERSATION_ATTRIBUTES', {
++      id: 1,
++    });
++    store.commit('conversation/setMessagesInConversation', [
++      { id: 100, conversation_id: 1, created_at: 10, content: 'Merci' },
++    ]);
++  });
++
++  afterEach(() => {
++    delete window.chatwootWebChannel;
++  });
++
++  it('catches up on the conversation opened offline once the socket reconnects', async () => {
++    // The socket drops while conversation 1 is on screen.
++    await store.dispatch('conversation/setLastMessageId');
++    goOffline();
++    await store.dispatch('conversationList/open', 2);
++    expect(shownMessageIds(store)).toEqual([]);
++
++    API.get.mockImplementation(serveOlderConversation);
++    await store.dispatch('conversation/syncLatestMessages');
++
++    expect(shownMessageIds(store)).toEqual([50]);
++  });
++
++  it('loads the conversation again when it is reopened after a failed load', async () => {
++    goOffline();
++    await store.dispatch('conversationList/open', 2);
++    expect(shownMessageIds(store)).toEqual([]);
++
++    API.get.mockImplementation(serveOlderConversation);
++    await store.dispatch('conversationList/open', 2);
++
++    expect(shownMessageIds(store)).toEqual([50]);
++  });
++
++  it('never reuses a cursor recorded in another conversation', async () => {
++    goOffline();
++    await store.dispatch('conversationList/open', 2);
++    // A disconnect noticed late records the cursor while conversation 2 is still empty.
++    await store.dispatch('conversation/setLastMessageId');
++
++    API.get.mockImplementation(serveOlderConversation);
++    await store.dispatch('conversation/syncLatestMessages');
++
++    expect(API.get).toHaveBeenLastCalledWith(
++      expect.stringContaining('/api/v1/widget/messages'),
++      { params: { before: undefined, after: null } }
++    );
++    expect(shownMessageIds(store)).toEqual([50]);
++  });
++});
+diff --git a/app/javascript/widget/views/ConversationList.vue b/app/javascript/widget/views/ConversationList.vue
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b18217acb3b15a914e15fb3e45781848d4ec77f
+--- /dev/null
++++ b/app/javascript/widget/views/ConversationList.vue
+@@ -0,0 +1,113 @@
++<script setup>
++import { onMounted } from 'vue';
++import { useRouter } from 'vue-router';
++import { getContrastingTextColor } from '@chatwoot/utils';
++import { useStore, useMapGetter } from 'dashboard/composables/store.js';
++import Spinner from 'shared/components/Spinner.vue';
++import ConversationListItem from 'widget/components/ConversationListItem.vue';
++
++const store = useStore();
++const router = useRouter();
++
++const conversations = useMapGetter('conversationList/getRecords');
++const hasNextPage = useMapGetter('conversationList/getHasNextPage');
++const isFetching = useMapGetter('conversationList/getIsFetching');
++const widgetColor = useMapGetter('appConfig/getWidgetColor');
++
++const { preChatFormEnabled } = window.chatwootWebChannel;
++const LOAD_MORE_THRESHOLD_PX = 160;
++
++onMounted(() => store.dispatch('conversationList/fetch'));
++
++const onScroll = ({ target }) => {
++  const remaining =
++    target.scrollHeight - target.scrollTop - target.clientHeight;
++  if (remaining < LOAD_MORE_THRESHOLD_PX) {
++    store.dispatch('conversationList/fetchMore');
++  }
++};
++
++const openConversation = async id => {
++  await store.dispatch('conversationList/open', id);
++  router.replace({ name: 'messages' });
++};
++
++const startNewConversation = async () => {
++  await store.dispatch('conversationList/startNew');
++  router.replace({ name: preChatFormEnabled ? 'prechat-form' : 'messages' });
++};
++</script>
++
++<template>
++  <div class="relative flex flex-col flex-1 overflow-hidden">
++    <div class="flex-1 p-4 overflow-auto pb-40" @scroll="onScroll">
++      <div
++        v-if="isFetching && !conversations.length"
++        class="flex justify-center py-8"
++        role="status"
++      >
++        <Spinner />
++      </div>
++      <div
++        v-else-if="!conversations.length"
++        class="flex flex-col items-center gap-3 px-6 py-12 text-center"
++      >
++        <span
++          class="flex items-center justify-center size-14 surface-card rounded-full"
++        >
++          <i
++            class="i-lucide-messages-square size-6 text-n-slate-11"
++            aria-hidden="true"
++          />
++        </span>
++        <h2 class="font-medium text-n-slate-12">
++          {{ $t('CONVERSATIONS.EMPTY_TITLE') }}
++        </h2>
++        <p class="text-sm text-n-slate-11">
++          {{ $t('CONVERSATIONS.EMPTY_DESCRIPTION') }}
++        </p>
++      </div>
++      <section v-else :aria-label="$t('CONVERSATIONS.TITLE')">
++        <h2 class="px-1 pb-3 text-sm font-medium text-n-slate-11">
++          {{ $t('CONVERSATIONS.TITLE') }}
++        </h2>
++        <ul class="flex flex-col gap-3">
++          <li
++            v-for="conversation in conversations"
++            :key="conversation.id"
++            class="overflow-hidden surface-card"
++          >
++            <ConversationListItem
++              :conversation="conversation"
++              class="px-4 py-2.5 transition-colors hover:bg-n-alpha-2"
++              @select="openConversation"
++            />
++          </li>
++        </ul>
++        <div
++          v-if="hasNextPage && isFetching"
++          class="flex justify-center py-4"
++          role="status"
++        >
++          <Spinner />
++        </div>
++      </section>
++    </div>
++    <div
++      class="absolute inset-x-0 z-50 flex justify-center pointer-events-none bottom-20"
++    >
++      <button
++        type="button"
++        class="inline-flex items-center gap-2 px-4 py-2 text-base font-medium rounded-lg pointer-events-auto outline-none shadow-[0_0_24px_10px_rgb(var(--surface-1)/0.9),0_14px_28px_-10px_rgba(50,50,93,0.45),0_4px_10px_-4px_rgba(50,50,93,0.25)] dark:shadow-[0_0_24px_10px_rgb(var(--surface-1)/0.9),0_14px_28px_-10px_rgba(0,0,0,0.8),0_4px_10px_-4px_rgba(0,0,0,0.5)] focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-n-slate-7"
++        :style="{
++          backgroundColor: widgetColor,
++          color: getContrastingTextColor(widgetColor),
++        }"
++        @click="startNewConversation"
++      >
++        <span>{{ $t('START_NEW_CONVERSATION') }}</span>
++        <i class="i-lucide-pencil-line size-4" aria-hidden="true" />
++      </button>
++    </div>
++  </div>
++</template>
+diff --git a/app/javascript/widget/views/Home.vue b/app/javascript/widget/views/Home.vue
+index 332783895d7165a197d93fe659106210c60fc228..ff952509d5df4bd737cc18bae86ad816f593c450 100755
+--- a/app/javascript/widget/views/Home.vue
++++ b/app/javascript/widget/views/Home.vue
+@@ -20,15 +20,40 @@ export default {
+       availableAgents: 'agent/availableAgents',
+       conversationSize: 'conversation/getConversationSize',
+       unreadMessageCount: 'conversation/getUnreadMessageCount',
++      latestConversation: 'conversationList/getLatestConversation',
+     }),
++    hasConversation() {
++      if (this.hasMultipleConversationsEnabled) {
++        return (
++          !!this.latestConversation &&
++          this.latestConversation.status !== 'resolved'
++        );
++      }
++      return !!this.conversationSize;
++    },
+   },
+   methods: {
+     startConversation() {
++      if (this.hasMultipleConversationsEnabled) {
++        return this.hasConversation
++          ? this.openConversation(this.latestConversation.id)
++          : this.startNewConversation();
++      }
+       if (this.preChatFormEnabled && !this.conversationSize) {
+         return this.router.replace({ name: 'prechat-form' });
+       }
+       return this.router.replace({ name: 'messages' });
+     },
++    async openConversation(id) {
++      await this.$store.dispatch('conversationList/open', id);
++      this.router.replace({ name: 'messages' });
++    },
++    async startNewConversation() {
++      await this.$store.dispatch('conversationList/startNew');
++      this.router.replace({
++        name: this.preChatFormEnabled ? 'prechat-form' : 'messages',
++      });
++    },
+   },
+ };
+ </script>
+@@ -37,7 +62,7 @@ export default {
+   <div class="z-50 flex flex-col justify-end flex-1 w-full p-4 gap-4">
+     <TeamAvailability
+       :available-agents="availableAgents"
+-      :has-conversation="!!conversationSize"
++      :has-conversation="hasConversation"
+       :unread-count="unreadMessageCount"
+       @start-conversation="startConversation"
+     />
+diff --git a/app/javascript/widget/views/Messages.vue b/app/javascript/widget/views/Messages.vue
+index adb23ed500907c83545ba20cbf2fd9a991c83abd..d4bbad9db2266e53d8f6892cddcb23d537ef0d32 100644
+--- a/app/javascript/widget/views/Messages.vue
++++ b/app/javascript/widget/views/Messages.vue
+@@ -1,5 +1,6 @@
+ <script>
+ import { mapGetters } from 'vuex';
++import { IFrameHelper } from 'widget/helpers/utils';
+ 
+ import ChatFooter from '../components/ChatFooter.vue';
+ import ConversationWrap from '../components/ConversationWrap.vue';
+@@ -9,18 +10,26 @@ export default {
+   computed: {
+     ...mapGetters({
+       groupedMessages: 'conversation/getGroupedConversation',
++      isWidgetOpen: 'appConfig/getIsWidgetOpen',
+     }),
++    isVisible() {
++      return this.isWidgetOpen || !IFrameHelper.isIFrame();
++    },
+   },
+-  mounted() {
+-    this.$store.dispatch('conversation/setUserLastSeen');
++  watch: {
++    // The thread can be on screen before the widget is opened; it is seen once it is visible.
++    isVisible: {
++      immediate: true,
++      handler(isVisible) {
++        if (isVisible) this.$store.dispatch('conversation/setUserLastSeen');
++      },
++    },
+   },
+ };
+ </script>
+ 
+ <template>
+-  <div
+-    class="flex flex-col flex-1 overflow-hidden rounded-b-lg bg-n-slate-2 dark:bg-n-solid-1"
+-  >
++  <div class="flex flex-col flex-1 overflow-hidden rounded-b-lg bg-n-surface-1">
+     <div class="flex flex-1 overflow-auto">
+       <ConversationWrap :grouped-messages="groupedMessages" />
+     </div>
+diff --git a/app/javascript/widget/views/specs/Messages.spec.js b/app/javascript/widget/views/specs/Messages.spec.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..600a5fcb9c52986c48172047a17a289116754027
+--- /dev/null
++++ b/app/javascript/widget/views/specs/Messages.spec.js
+@@ -0,0 +1,62 @@
++import { shallowMount } from '@vue/test-utils';
++import { createStore } from 'vuex';
++import { IFrameHelper } from 'widget/helpers/utils';
++import Messages from '../Messages.vue';
++
++vi.mock('widget/helpers/utils', async importOriginal => {
++  const utils = await importOriginal();
++  return {
++    ...utils,
++    IFrameHelper: { ...utils.IFrameHelper, isIFrame: vi.fn() },
++  };
++});
++
++describe('Messages', () => {
++  const setUserLastSeen = vi.fn();
++  const mountWith = isWidgetOpen => {
++    const store = createStore({
++      modules: {
++        appConfig: {
++          namespaced: true,
++          state: { isWidgetOpen },
++          getters: { getIsWidgetOpen: state => state.isWidgetOpen },
++          mutations: {
++            open(state) {
++              state.isWidgetOpen = true;
++            },
++          },
++        },
++        conversation: {
++          namespaced: true,
++          getters: { getGroupedConversation: () => [] },
++          actions: { setUserLastSeen },
++        },
++      },
++    });
++    shallowMount(Messages, { global: { plugins: [store] } });
++    return store;
++  };
++
++  it('marks the conversation as seen only once the widget is opened', async () => {
++    IFrameHelper.isIFrame.mockReturnValue(true);
++    const store = mountWith(false);
++    expect(setUserLastSeen).not.toBeCalled();
++
++    store.commit('appConfig/open');
++    await Promise.resolve();
++
++    expect(setUserLastSeen).toHaveBeenCalledTimes(1);
++  });
++
++  it('marks the conversation as seen right away when it is visible', () => {
++    IFrameHelper.isIFrame.mockReturnValue(true);
++    mountWith(true);
++    expect(setUserLastSeen).toHaveBeenCalledTimes(1);
++  });
++
++  it('marks the conversation as seen right away outside an iframe', () => {
++    IFrameHelper.isIFrame.mockReturnValue(false);
++    mountWith(false);
++    expect(setUserLastSeen).toHaveBeenCalledTimes(1);
++  });
++});
+diff --git a/app/models/channel/web_widget.rb b/app/models/channel/web_widget.rb
+index 54f342aa6bdb01ef0d28ee2e62db8dec2f8f4f7d..10db18fd06913e1b4e1f811275b8b4c1ba4c082f 100644
+--- a/app/models/channel/web_widget.rb
++++ b/app/models/channel/web_widget.rb
+@@ -52,6 +52,7 @@ class Channel::WebWidget < ApplicationRecord
+             3 => :end_conversation,
+             4 => :use_inbox_avatar_for_bot,
+             5 => :allow_mobile_webview,
++            6 => :multiple_conversations,
+             :column => 'feature_flags',
+             :check_for_column => false
+ 
+diff --git a/app/models/message.rb b/app/models/message.rb
+index 069e15d53b5871a9003b2a4205cbdd518cb45c1f..5c9a131bb4a1ea0ad53da253080bad435ee0f632 100644
+--- a/app/models/message.rb
++++ b/app/models/message.rb
+@@ -120,6 +120,7 @@ class Message < ApplicationRecord
+ 
+   scope :created_since, ->(datetime) { where('created_at > ?', datetime) }
+   scope :chat, -> { where.not(message_type: :activity).where(private: false) }
++  scope :not_deleted, -> { where("((messages.content_attributes #>> '{}')::jsonb ->> 'deleted') IS DISTINCT FROM 'true'") }
+   scope :non_activity_messages, -> { where.not(message_type: :activity).reorder('created_at desc') }
+   scope :today, -> { where("date_trunc('day', created_at) = ?", Date.current) }
+   scope :not_forwarded, -> { where("(messages.content_attributes #>> '{}')::jsonb -> 'forwarded_message_id' IS NULL") }
+diff --git a/app/views/api/v1/models/_widget_conversation.json.jbuilder b/app/views/api/v1/models/_widget_conversation.json.jbuilder
+new file mode 100644
+index 0000000000000000000000000000000000000000..8651b9a7402c9ae2aba5b5fe077e260f71fbc2a7
+--- /dev/null
++++ b/app/views/api/v1/models/_widget_conversation.json.jbuilder
+@@ -0,0 +1,19 @@
++json.id resource.display_id
++json.status resource.status
++json.created_at resource.created_at.to_i
++json.last_activity_at resource.last_activity_at.to_i
++json.contact_last_seen_at resource.contact_last_seen_at.to_i
++json.unread_count unread_count
++
++if resource.assignee.present?
++  json.assignee do
++    json.name resource.assignee.available_name
++    json.avatar_url resource.assignee.avatar_url
++  end
++end
++
++if last_message.present?
++  json.last_message do
++    json.partial! 'api/v1/models/widget_message', resource: last_message
++  end
++end
+diff --git a/app/views/api/v1/widget/conversations/list.json.jbuilder b/app/views/api/v1/widget/conversations/list.json.jbuilder
+new file mode 100644
+index 0000000000000000000000000000000000000000..50dfcf38d16bb8874a636f010fa2aaf1cef299c5
+--- /dev/null
++++ b/app/views/api/v1/widget/conversations/list.json.jbuilder
+@@ -0,0 +1,13 @@
++json.payload do
++  json.array! @conversations do |conversation|
++    json.partial! 'api/v1/models/widget_conversation',
++                  resource: conversation,
++                  unread_count: @unread_counts.fetch(conversation.id, 0),
++                  last_message: @last_messages[conversation.id]
++  end
++end
++
++json.meta do
++  json.has_next_page !@conversations.last_page?
++  json.unread_count @unread_conversation_count
++end
+diff --git a/config/routes.rb b/config/routes.rb
+index 9124088466d0e69d506ac5c38ec890c2922f14cc..9f6c4b968d2f28e30fd41beb921c6c3bbe978e3e 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -583,6 +583,7 @@ Rails.application.routes.draw do
+             post :toggle_typing
+             post :transcript
+             get  :toggle_status
++            get  :list
+           end
+         end
+         resource :contact, only: [:show, :update] do
+diff --git a/spec/builders/campaigns/campaign_conversation_builder_spec.rb b/spec/builders/campaigns/campaign_conversation_builder_spec.rb
+index fb51bf09ade965f2eb2b5c3cfeddda486378e0d6..dafa47d2c3e29c0333a32a0a616f5309d0e1a6ae 100644
+--- a/spec/builders/campaigns/campaign_conversation_builder_spec.rb
++++ b/spec/builders/campaigns/campaign_conversation_builder_spec.rb
+@@ -37,5 +37,18 @@ describe Campaigns::CampaignConversationBuilder do
+ 
+       expect(campaign_conversation).to be_nil
+     end
++
++    it 'creates another conversation when the widget supports multiple conversations' do
++      inbox.channel.update!(multiple_conversations: true)
++      create(:conversation, contact_inbox_id: contact_inbox.id, inbox: inbox, account: account)
++
++      campaign_conversation = described_class.new(
++        contact_inbox_id: contact_inbox.id,
++        campaign_display_id: campaign.display_id
++      ).perform
++
++      expect(campaign_conversation.campaign_id).to eq(campaign.id)
++      expect(contact_inbox.conversations.count).to eq(2)
++    end
+   end
+ end
+diff --git a/spec/controllers/api/v1/widget/conversations_controller_spec.rb b/spec/controllers/api/v1/widget/conversations_controller_spec.rb
+index c1369a99722903bd4379796c239028556fe3d3b3..19f7bbebb741b41011109a5c04537aeeef03ae69 100644
+--- a/spec/controllers/api/v1/widget/conversations_controller_spec.rb
++++ b/spec/controllers/api/v1/widget/conversations_controller_spec.rb
+@@ -61,6 +61,99 @@ RSpec.describe '/api/v1/widget/conversations/toggle_typing', type: :request do
+     end
+   end
+ 
++  describe 'GET /api/v1/widget/conversations/list' do
++    let!(:older_conversation) do
++      create(:conversation, contact: contact, account: account, inbox: web_widget.inbox, contact_inbox: contact_inbox,
++                            status: :resolved, last_activity_at: 2.days.ago)
++    end
++
++    before do
++      allow(Rails.configuration.dispatcher).to receive(:dispatch)
++      web_widget.update!(multiple_conversations: true)
++      create(:message, account: account, inbox: web_widget.inbox, conversation: conversation, content: 'visitor question')
++      create(:message, account: account, inbox: web_widget.inbox, conversation: conversation, content: 'agent reply', message_type: :outgoing)
++      create(:message, account: account, inbox: web_widget.inbox, conversation: conversation, content: 'private note',
++                       message_type: :outgoing, private: true)
++      create(:message, account: account, inbox: web_widget.inbox, conversation: older_conversation, content: 'old reply', message_type: :outgoing)
++      # Message creation bumps last_activity_at, so pin the order after the messages exist.
++      older_conversation.update!(contact_last_seen_at: Time.current, last_activity_at: 2.days.ago)
++    end
++
++    it 'lists only the visitor conversations, most recently active first' do
++      create(:conversation, account: account, inbox: web_widget.inbox)
++
++      get '/api/v1/widget/conversations/list',
++          headers: { 'X-Auth-Token' => token },
++          params: { website_token: web_widget.website_token },
++          as: :json
++
++      expect(response).to have_http_status(:success)
++      expect(response.parsed_body['payload'].pluck('id')).to eq([conversation.display_id, older_conversation.display_id])
++      expect(response.parsed_body['payload'].pluck('status')).to eq(%w[open resolved])
++      expect(response.parsed_body['meta']['has_next_page']).to be(false)
++    end
++
++    it 'includes the unread count and the last visible message of each conversation' do
++      get '/api/v1/widget/conversations/list',
++          headers: { 'X-Auth-Token' => token },
++          params: { website_token: web_widget.website_token },
++          as: :json
++
++      latest, older = response.parsed_body['payload']
++      expect(latest['unread_count']).to eq(1)
++      expect(latest['last_message']['content']).to eq('agent reply')
++      expect(older['unread_count']).to eq(0)
++      expect(older['last_message']['content']).to eq('old reply')
++    end
++
++    it 'skips deleted messages like the widget thread does' do
++      create(:message, account: account, inbox: web_widget.inbox, conversation: conversation, content: 'This message was deleted',
++                       message_type: :outgoing, content_attributes: { deleted: true })
++
++      get '/api/v1/widget/conversations/list',
++          headers: { 'X-Auth-Token' => token },
++          params: { website_token: web_widget.website_token },
++          as: :json
++
++      latest = response.parsed_body['payload'].first
++      expect(latest['unread_count']).to eq(1)
++      expect(latest['last_message']['content']).to eq('agent reply')
++    end
++
++    it 'counts the conversations with unread messages across all pages' do
++      stub_const('Api::V1::Widget::ConversationsController::RESULTS_PER_PAGE', 1)
++
++      get '/api/v1/widget/conversations/list',
++          headers: { 'X-Auth-Token' => token },
++          params: { website_token: web_widget.website_token, page: 2 },
++          as: :json
++
++      expect(response.parsed_body['meta']['unread_count']).to eq(1)
++    end
++
++    it 'paginates the list' do
++      stub_const('Api::V1::Widget::ConversationsController::RESULTS_PER_PAGE', 1)
++
++      get '/api/v1/widget/conversations/list',
++          headers: { 'X-Auth-Token' => token },
++          params: { website_token: web_widget.website_token, page: 2 },
++          as: :json
++
++      expect(response.parsed_body['payload'].pluck('id')).to eq([older_conversation.display_id])
++      expect(response.parsed_body['meta']['has_next_page']).to be(false)
++    end
++
++    it 'returns an empty list for a session without conversations' do
++      get '/api/v1/widget/conversations/list',
++          headers: { 'X-Auth-Token' => token_without_conversation },
++          params: { website_token: web_widget.website_token },
++          as: :json
++
++      expect(response).to have_http_status(:success)
++      expect(response.parsed_body['payload']).to be_empty
++    end
++  end
++
+   describe 'POST /api/v1/widget/conversations' do
+     it 'creates a conversation with correct details' do
+       post '/api/v1/widget/conversations',
+@@ -405,4 +498,60 @@ RSpec.describe '/api/v1/widget/conversations/toggle_typing', type: :request do
+       end
+     end
+   end
++
++  describe 'naming an older conversation while multiple conversations are disabled' do
++    let!(:latest_conversation) do
++      create(:conversation, contact: contact, account: account, inbox: web_widget.inbox, contact_inbox: contact_inbox)
++    end
++    let(:older_params) { { website_token: web_widget.website_token, conversation_id: conversation.display_id } }
++
++    before do
++      allow(Rails.configuration.dispatcher).to receive(:dispatch)
++      web_widget.update!(multiple_conversations: false)
++    end
++
++    it 'returns the latest conversation' do
++      get '/api/v1/widget/conversations', headers: { 'X-Auth-Token' => token }, params: older_params, as: :json
++
++      expect(response.parsed_body['id']).to eq(latest_conversation.display_id)
++    end
++
++    it 'resolves the latest conversation only' do
++      get '/api/v1/widget/conversations/toggle_status', headers: { 'X-Auth-Token' => token }, params: older_params, as: :json
++
++      expect(latest_conversation.reload).to be_resolved
++      expect(conversation.reload).to be_open
++    end
++
++    it 'sets custom attributes on the latest conversation only' do
++      post '/api/v1/widget/conversations/set_custom_attributes',
++           headers: { 'X-Auth-Token' => token },
++           params: older_params.merge(custom_attributes: { plan: 'pro' }),
++           as: :json
++
++      expect(latest_conversation.reload.custom_attributes).to include('plan' => 'pro')
++      expect(conversation.reload.custom_attributes).not_to include('plan')
++    end
++
++    it 'marks the latest conversation as seen only' do
++      post '/api/v1/widget/conversations/update_last_seen', headers: { 'X-Auth-Token' => token }, params: older_params, as: :json
++
++      expect(latest_conversation.reload.contact_last_seen_at).to be_present
++      expect(conversation.reload.contact_last_seen_at).to be_nil
++    end
++
++    it 'lists the latest conversation only' do
++      create(:message, account: account, inbox: web_widget.inbox, conversation: conversation, content: 'older agent reply',
++                       message_type: :outgoing)
++      create(:message, account: account, inbox: web_widget.inbox, conversation: latest_conversation, content: 'latest agent reply',
++                       message_type: :outgoing)
++
++      get '/api/v1/widget/conversations/list', headers: { 'X-Auth-Token' => token }, params: older_params, as: :json
++
++      expect(response).to have_http_status(:success)
++      expect(response.parsed_body['payload'].pluck('id')).to eq([latest_conversation.display_id])
++      expect(response.parsed_body['payload'].first['last_message']['content']).to eq('latest agent reply')
++      expect(response.parsed_body['meta']).to eq('has_next_page' => false, 'unread_count' => 1)
++    end
++  end
+ end
+diff --git a/spec/controllers/api/v1/widget/messages_controller_spec.rb b/spec/controllers/api/v1/widget/messages_controller_spec.rb
+index 8d1ef48b58e5de469249c36f65df4daed6feddb2..0419985f413db6ad57dbc3db70a24587598ab023 100644
+--- a/spec/controllers/api/v1/widget/messages_controller_spec.rb
++++ b/spec/controllers/api/v1/widget/messages_controller_spec.rb
+@@ -287,6 +287,109 @@ RSpec.describe '/api/v1/widget/messages', type: :request do
+     end
+   end
+ 
++  describe 'with multiple conversations enabled' do
++    let!(:older_conversation) do
++      create(:conversation, contact: contact, account: account, inbox: web_widget.inbox, contact_inbox: contact_inbox,
++                            created_at: 1.day.ago, last_activity_at: 1.day.ago)
++    end
++
++    before do
++      web_widget.update!(multiple_conversations: true)
++      create(:message, account: account, inbox: web_widget.inbox, conversation: older_conversation, content: 'older thread')
++    end
++
++    it 'returns the messages of the requested conversation' do
++      get api_v1_widget_messages_url,
++          params: { website_token: web_widget.website_token, conversation_id: older_conversation.display_id },
++          headers: { 'X-Auth-Token' => token },
++          as: :json
++
++      expect(response).to have_http_status(:success)
++      expect(response.parsed_body['payload'].pluck('conversation_id').uniq).to eq([older_conversation.display_id])
++    end
++
++    it 'returns no messages for a new conversation' do
++      get api_v1_widget_messages_url,
++          params: { website_token: web_widget.website_token, conversation_id: '' },
++          headers: { 'X-Auth-Token' => token },
++          as: :json
++
++      expect(response).to have_http_status(:success)
++      expect(response.parsed_body['payload']).to be_empty
++    end
++
++    it 'returns not found for a conversation that does not belong to the visitor' do
++      other_conversation = create(:conversation, account: account, inbox: web_widget.inbox)
++
++      get api_v1_widget_messages_url,
++          params: { website_token: web_widget.website_token, conversation_id: other_conversation.display_id },
++          headers: { 'X-Auth-Token' => token },
++          as: :json
++
++      expect(response).to have_http_status(:not_found)
++    end
++
++    it 'appends the message to the named conversation instead of the latest one' do
++      post api_v1_widget_messages_url,
++           params: { website_token: web_widget.website_token, conversation_id: older_conversation.display_id, message: { content: 'reply' } },
++           headers: { 'X-Auth-Token' => token },
++           as: :json
++
++      expect(response).to have_http_status(:success)
++      expect(response.parsed_body['conversation_id']).to eq(older_conversation.display_id)
++      expect(older_conversation.reload.messages.last.content).to eq('reply')
++    end
++
++    it 'starts a new conversation when asked for one, even though an open one exists' do
++      expect do
++        post api_v1_widget_messages_url,
++             params: { website_token: web_widget.website_token, conversation_id: '', message: { content: 'a fresh question' } },
++             headers: { 'X-Auth-Token' => token },
++             as: :json
++      end.to change(Conversation, :count).by(1)
++
++      expect(response).to have_http_status(:success)
++      expect(response.parsed_body['conversation_id']).not_to eq(conversation.display_id)
++    end
++
++    it 'keeps widgets loaded before the feature was enabled on the latest conversation' do
++      expect do
++        post api_v1_widget_messages_url,
++             params: { website_token: web_widget.website_token, message: { content: 'still the same chat' } },
++             headers: { 'X-Auth-Token' => token },
++             as: :json
++      end.not_to change(Conversation, :count)
++
++      expect(response.parsed_body['conversation_id']).to eq(contact_inbox.conversations.last.display_id)
++    end
++
++    it 'ignores the named conversation when the feature is disabled' do
++      web_widget.update!(multiple_conversations: false)
++
++      post api_v1_widget_messages_url,
++           params: { website_token: web_widget.website_token, conversation_id: older_conversation.display_id, message: { content: 'reply' } },
++           headers: { 'X-Auth-Token' => token },
++           as: :json
++
++      expect(response).to have_http_status(:success)
++      expect(response.parsed_body['conversation_id']).to eq(contact_inbox.conversations.last.display_id)
++    end
++
++    it 'rejects replies to a named resolved conversation when the inbox does not allow them' do
++      web_widget.inbox.update!(allow_messages_after_resolved: false)
++      older_conversation.resolved!
++
++      expect do
++        post api_v1_widget_messages_url,
++             params: { website_token: web_widget.website_token, conversation_id: older_conversation.display_id, message: { content: 'reply' } },
++             headers: { 'X-Auth-Token' => token },
++             as: :json
++      end.to not_change(Conversation, :count).and not_change(Message, :count)
++
++      expect(response).to have_http_status(:forbidden)
++    end
++  end
++
+   describe 'PUT /api/v1/widget/messages' do
+     context 'when put request targets a message from another visitor in the same inbox' do
+       it 'does not update the foreign message' do
+diff --git a/swagger/definitions/request/inbox/channels/create_web_widget_channel_payload.yml b/swagger/definitions/request/inbox/channels/create_web_widget_channel_payload.yml
+index b4e215a63db53f0b9de940acad2b6e5920afc972..492b33dff5cd6ede4890a931cc1b6151c6232270 100644
+--- a/swagger/definitions/request/inbox/channels/create_web_widget_channel_payload.yml
++++ b/swagger/definitions/request/inbox/channels/create_web_widget_channel_payload.yml
+@@ -62,5 +62,5 @@ properties:
+     description: Enabled widget feature flags
+     items:
+       type: string
+-      enum: ['attachments', 'emoji_picker', 'end_conversation', 'use_inbox_avatar_for_bot', 'allow_mobile_webview']
++      enum: ['attachments', 'emoji_picker', 'end_conversation', 'use_inbox_avatar_for_bot', 'allow_mobile_webview', 'multiple_conversations']
+     example: ['attachments', 'emoji_picker', 'end_conversation']
+diff --git a/swagger/definitions/request/inbox/channels/update_web_widget_channel_payload.yml b/swagger/definitions/request/inbox/channels/update_web_widget_channel_payload.yml
+index f928a178260593798d57eb49b428faea65c122d5..312030be48da6316a8f62df95a414f89fbdd3a15 100644
+--- a/swagger/definitions/request/inbox/channels/update_web_widget_channel_payload.yml
++++ b/swagger/definitions/request/inbox/channels/update_web_widget_channel_payload.yml
+@@ -55,5 +55,5 @@ properties:
+     description: Enabled widget feature flags
+     items:
+       type: string
+-      enum: ['attachments', 'emoji_picker', 'end_conversation', 'use_inbox_avatar_for_bot', 'allow_mobile_webview']
++      enum: ['attachments', 'emoji_picker', 'end_conversation', 'use_inbox_avatar_for_bot', 'allow_mobile_webview', 'multiple_conversations']
+     example: ['attachments', 'emoji_picker', 'end_conversation']
+diff --git a/swagger/swagger.json b/swagger/swagger.json
+index 4f623e1cb547f959f035f52724b89deb49abe930..994a87c6128c043d3cae32118fa224371b4e36f1 100644
+--- a/swagger/swagger.json
++++ b/swagger/swagger.json
+@@ -14746,7 +14746,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
+@@ -15227,7 +15228,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
+diff --git a/swagger/tag_groups/application_swagger.json b/swagger/tag_groups/application_swagger.json
+index ec32f28d81b3203dd47b9eab5890a6e66ed57172..de14ae6f93c100cb313c2ae4fc30d9a5a8898433 100644
+--- a/swagger/tag_groups/application_swagger.json
++++ b/swagger/tag_groups/application_swagger.json
+@@ -13102,7 +13102,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
+@@ -13583,7 +13584,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
+diff --git a/swagger/tag_groups/client_swagger.json b/swagger/tag_groups/client_swagger.json
+index ec7defab724bf6a872bbd915d52d1eaf3cab7f91..493e2670cebcded26908af8060925c66b7e14028 100644
+--- a/swagger/tag_groups/client_swagger.json
++++ b/swagger/tag_groups/client_swagger.json
+@@ -4416,7 +4416,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
+@@ -4897,7 +4898,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
+diff --git a/swagger/tag_groups/other_swagger.json b/swagger/tag_groups/other_swagger.json
+index 332d72a25f6455c8ca8717cee8536bb2bd4f90da..d54b2779d61db539a215d1f0e67a511408746fbd 100644
+--- a/swagger/tag_groups/other_swagger.json
++++ b/swagger/tag_groups/other_swagger.json
+@@ -3810,7 +3810,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
+@@ -4291,7 +4292,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
+diff --git a/swagger/tag_groups/platform_swagger.json b/swagger/tag_groups/platform_swagger.json
+index 4f4a3b6fb44f93949aa1a8d06c24674aa3ed3cf2..e7ccfb3e61f55850d646488b64fa040e2cec47d9 100644
+--- a/swagger/tag_groups/platform_swagger.json
++++ b/swagger/tag_groups/platform_swagger.json
+@@ -4701,7 +4701,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
+@@ -5182,7 +5183,8 @@
+                 "emoji_picker",
+                 "end_conversation",
+                 "use_inbox_avatar_for_bot",
+-                "allow_mobile_webview"
++                "allow_mobile_webview",
++                "multiple_conversations"
+               ]
+             },
+             "example": [
