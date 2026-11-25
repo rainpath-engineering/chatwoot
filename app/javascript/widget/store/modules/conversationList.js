@@ -8,6 +8,8 @@ const state = {
   unreadCount: 0,
   // Bumped whenever another thread takes the screen, so late responses can tell they are stale.
   thread: 0,
+  // Bumped when setUser switches the visitor, so a list requested for the previous one is dropped.
+  identity: 0,
   uiFlags: {
     isFetching: false,
   },
@@ -29,12 +31,14 @@ export const getters = {
 };
 
 export const actions = {
-  fetch: async ({ commit }, { page = 1 } = {}) => {
+  fetch: async ({ state: listState, commit }, { page = 1 } = {}) => {
+    const { identity } = listState;
     commit('setFetching', true);
     try {
       const {
         data: { payload, meta },
       } = await getConversationsAPI({ page });
+      if (listState.identity !== identity) return;
       commit('setRecords', {
         payload,
         page,
@@ -44,7 +48,7 @@ export const actions = {
     } catch (error) {
       // Ignore error
     } finally {
-      commit('setFetching', false);
+      if (listState.identity === identity) commit('setFetching', false);
     }
   },
 
@@ -110,6 +114,11 @@ export const actions = {
     commit('setLastMessage', message);
   },
 
+  // The previous visitor's previews must not stay on screen, nor be restored by a late response.
+  switchIdentity: ({ commit }) => {
+    commit('switchIdentity');
+  },
+
   startNew: async ({ commit, dispatch }) => {
     commit('switchThread');
     await dispatch(
@@ -149,6 +158,14 @@ export const mutations = {
   },
   switchThread($state) {
     $state.thread += 1;
+  },
+  switchIdentity($state) {
+    $state.identity += 1;
+    $state.records = [];
+    $state.page = 0;
+    $state.hasNextPage = false;
+    $state.unreadCount = 0;
+    $state.uiFlags.isFetching = false;
   },
   setFetching($state, isFetching) {
     $state.uiFlags.isFetching = isFetching;

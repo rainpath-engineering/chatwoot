@@ -20,7 +20,7 @@ describe('#actions', () => {
           meta: { has_next_page: true, unread_count: 1 },
         },
       });
-      await actions.fetch({ commit });
+      await actions.fetch({ state: { identity: 0 }, commit });
       expect(commit.mock.calls).toEqual([
         ['setFetching', true],
         [
@@ -33,11 +33,26 @@ describe('#actions', () => {
 
     it('clears the loading flag when the API fails', async () => {
       API.get.mockRejectedValue(new Error('offline'));
-      await actions.fetch({ commit });
+      await actions.fetch({ state: { identity: 0 }, commit });
       expect(commit.mock.calls).toEqual([
         ['setFetching', true],
         ['setFetching', false],
       ]);
+    });
+
+    it('drops a response requested before setUser switched the visitor', async () => {
+      const state = { identity: 0 };
+      API.get.mockImplementation(async () => {
+        state.identity += 1;
+        return {
+          data: {
+            payload: records,
+            meta: { has_next_page: false, unread_count: 1 },
+          },
+        };
+      });
+      await actions.fetch({ state, commit });
+      expect(commit.mock.calls).toEqual([['setFetching', true]]);
     });
   });
 
@@ -236,6 +251,13 @@ describe('#actions', () => {
       const message = { id: 40, conversation_id: 2 };
       actions.updateLastMessage({ commit }, message);
       expect(commit).toBeCalledWith('setLastMessage', message);
+    });
+  });
+
+  describe('#switchIdentity', () => {
+    it('forgets the previous visitor list', () => {
+      actions.switchIdentity({ commit });
+      expect(commit.mock.calls).toEqual([['switchIdentity']]);
     });
   });
 

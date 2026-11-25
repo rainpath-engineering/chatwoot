@@ -83,6 +83,28 @@ describe('#mutations', () => {
     });
   });
 
+  describe('#switchIdentity', () => {
+    it('moves to the next identity and forgets the previous visitor list', () => {
+      const state = {
+        identity: 1,
+        records: [{ id: 1, unread_count: 4 }],
+        page: 2,
+        hasNextPage: true,
+        unreadCount: 1,
+        uiFlags: { isFetching: true },
+      };
+      mutations.switchIdentity(state);
+      expect(state).toEqual({
+        identity: 2,
+        records: [],
+        page: 0,
+        hasNextPage: false,
+        unreadCount: 0,
+        uiFlags: { isFetching: false },
+      });
+    });
+  });
+
   describe('#markRead', () => {
     it('clears the conversation and drops it from the unread total once', () => {
       const state = { records: [{ id: 1, unread_count: 4 }], unreadCount: 2 };

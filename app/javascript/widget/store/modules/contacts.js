@@ -82,6 +82,7 @@ export const actions = {
       dispatch('get');
       if (identifierHash || widgetAuthToken) {
         if (isMultipleConversationsEnabled()) {
+          dispatch('conversationList/switchIdentity', {}, { root: true });
           dispatch('conversationList/load', {}, { root: true });
         } else {
           dispatch('conversation/clearConversations', {}, { root: true });
