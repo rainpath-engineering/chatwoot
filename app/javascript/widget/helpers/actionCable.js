@@ -91,10 +91,10 @@ class ActionCableConnector extends BaseActionCableConnector {
   };
 
   onStatusChange = data => {
-    const { id } =
-      this.app.$store.getters['conversationAttributes/getConversationParams'];
-    const isOnScreen = !isMultipleConversationsEnabled() || data.id === id;
-    if (data.status === 'resolved' && isOnScreen) {
+    // With multiple conversations a campaign prompt belongs to no existing conversation: clicking
+    // it starts a new one. Resolving any of them, even the one opened in the background, must
+    // leave the prompt alone.
+    if (data.status === 'resolved' && !isMultipleConversationsEnabled()) {
       this.app.$store.dispatch('campaign/resetCampaign');
     }
     this.app.$store.dispatch('conversationAttributes/update', data);

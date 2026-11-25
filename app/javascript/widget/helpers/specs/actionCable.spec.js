@@ -219,12 +219,19 @@ describe('Widget ActionCableConnector', () => {
       expect(mockDispatch).toBeCalledWith('conversationList/fetch');
     });
 
-    it('resets the campaign only when the conversation on screen is resolved', () => {
+    // A campaign prompt never belongs to an existing conversation: clicking it starts a new one.
+    it('keeps the campaign prompt when another conversation is resolved', () => {
       connector.onStatusChange({ id: 2, status: 'resolved' });
       expect(mockDispatch).not.toBeCalledWith('campaign/resetCampaign');
+    });
 
+    it('keeps the campaign prompt when the conversation opened in the background is resolved', () => {
       connector.onStatusChange({ id: 1, status: 'resolved' });
-      expect(mockDispatch).toBeCalledWith('campaign/resetCampaign');
+      expect(mockDispatch).not.toBeCalledWith('campaign/resetCampaign');
+      expect(mockDispatch).toBeCalledWith('conversationAttributes/update', {
+        id: 1,
+        status: 'resolved',
+      });
     });
 
     it('refreshes the list on status changes and reconnects', () => {
