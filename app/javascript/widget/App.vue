@@ -22,6 +22,7 @@ import { useRouter } from 'vue-router';
 import { useAvailability } from 'widget/composables/useAvailability';
 import { SDK_SET_BUBBLE_VISIBILITY } from '../shared/constants/sharedFrameEvents';
 import { emitter } from 'shared/helpers/mitt';
+import { handleMessageLinkClick } from './helpers/linkInterceptHelper';
 
 export default {
   name: 'App',
@@ -56,6 +57,7 @@ export default {
       latestConversation: 'conversationList/getLatestConversation',
       isWidgetStyleFlat: 'appConfig/isWidgetStyleFlat',
       showUnreadMessagesDialog: 'appConfig/getShowUnreadMessagesDialog',
+      linkInterceptOrigins: 'appConfig/getLinkInterceptOrigins',
     }),
     totalUnreadCount() {
       return this.unreadMessageCount + this.otherConversationsUnreadCount;
@@ -110,6 +112,7 @@ export default {
     setHeader(window.authToken);
     if (this.isIFrame) {
       this.registerListeners();
+      document.addEventListener('click', this.onMessageLinkClick);
       this.sendLoadedEvent();
     } else {
       this.loadConversations();
@@ -125,6 +128,9 @@ export default {
     }
     this.registerUnreadEvents();
     this.registerCampaignEvents();
+  },
+  beforeUnmount() {
+    document.removeEventListener('click', this.onMessageLinkClick);
   },
   methods: {
     ...mapActions('appConfig', [
@@ -156,6 +162,10 @@ export default {
         this.router.replace({ name: 'messages' });
       }
       return undefined;
+    },
+    // Links to the origins the host page asked for are handed to it.
+    onMessageLinkClick(event) {
+      handleMessageLinkClick(event, this.linkInterceptOrigins);
     },
     setWidgetColorVariable(widgetColor) {
       if (widgetColor) {

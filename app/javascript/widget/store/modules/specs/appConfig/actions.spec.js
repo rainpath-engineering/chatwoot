@@ -1,5 +1,9 @@
 import { actions } from '../../appConfig';
 
+// A script URL, the classic link injection payload.
+// eslint-disable-next-line no-script-url
+const SCRIPT_URL = 'javascript:alert(1)';
+
 const commit = vi.fn();
 describe('#actions', () => {
   describe('#setReferrerHost', () => {
@@ -36,6 +40,31 @@ describe('#actions', () => {
     it('creates actions properly', () => {
       actions.setRouteTransitionState({ commit }, false);
       expect(commit.mock.calls).toEqual([['SET_ROUTE_UPDATE_STATE', false]]);
+    });
+  });
+
+  describe('#setAppConfig', () => {
+    it('keeps only the valid link interception origins', () => {
+      actions.setAppConfig(
+        { commit },
+        {
+          linkInterceptOrigins: [
+            'https://app.example.com',
+            'http://localhost:5173',
+            'http://app.example.com',
+            SCRIPT_URL,
+          ],
+        }
+      );
+      expect(commit.mock.calls[0][1].linkInterceptOrigins).toEqual([
+        'https://app.example.com',
+        'http://localhost:5173',
+      ]);
+    });
+
+    it('defaults to no link interception', () => {
+      actions.setAppConfig({ commit }, {});
+      expect(commit.mock.calls[0][1].linkInterceptOrigins).toEqual([]);
     });
   });
 });

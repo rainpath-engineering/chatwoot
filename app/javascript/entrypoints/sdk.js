@@ -17,6 +17,7 @@ import {
 } from '../sdk/DOMHelpers';
 import { setCookieWithDomain } from '../sdk/cookieHelpers';
 import { SDK_SET_BUBBLE_VISIBILITY } from 'shared/constants/sharedFrameEvents';
+import { sanitizeLinkInterceptOrigins } from 'shared/helpers/linkInterceptHelper';
 
 const runSDK = ({ baseUrl, websiteToken }) => {
   if (window.$chatwoot) {
@@ -79,6 +80,9 @@ const runSDK = ({ baseUrl, websiteToken }) => {
     enableFileUpload: chatwootSettings.enableFileUpload,
     enableEmojiPicker: chatwootSettings.enableEmojiPicker ?? true,
     enableEndConversation: chatwootSettings.enableEndConversation ?? true,
+    linkInterceptOrigins: sanitizeLinkInterceptOrigins(
+      chatwootSettings.linkInterceptOrigins
+    ),
 
     toggle(state) {
       IFrameHelper.events.toggleBubble(state);

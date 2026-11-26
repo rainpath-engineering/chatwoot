@@ -1,10 +1,23 @@
 # RainPath patches on Chatwoot
 
 This fork tracks Chatwoot releases. RainPath-specific changes are carried as
-patches in `rainpath/patches/`, so they can be re-applied on each new release
-and dropped once upstream ships the same thing.
+a single patch, `rainpath/patches/rainpath.patch`, so they can be re-applied
+on each new release and dropped once upstream ships the same thing.
 
-## `widget-multi-conversations.patch` (RAI-4201)
+The patch is the full diff from the release commit to the fork branch
+(`rainpath/vX.Y.Z`), this folder excluded. It holds two features, described
+below. Both are off unless explicitly enabled, so applying the patch changes
+nothing for an inbox or a page that does not opt in.
+
+| Feature                              | Linear   | Enabled by                                |
+| ------------------------------------ | -------- | ----------------------------------------- |
+| Multiple conversations in the widget | RAI-4201 | an inbox setting                          |
+| Link interception for the host page  | RAI-4261 | a `chatwootSettings` key on the host page |
+
+The file was named `widget-multi-conversations.patch` until it carried a
+second feature.
+
+## Multiple conversations in the widget (RAI-4201)
 
 ### What it does
 
@@ -20,7 +33,7 @@ instead of being tied to the latest one:
 - the backend gets `GET /api/v1/widget/conversations/list`, and the widget
   endpoints accept a `conversation_id` to act on a given conversation.
 
-The patch is the squash of upstream PR
+This part is the squash of upstream PR
 [chatwoot/chatwoot#16002](https://github.com/chatwoot/chatwoot/pull/16002)
 ("feat: support multiple conversations in the widget", branch
 `feat/CW-8283`, head `f9ddb12ab8`), plus four fixes for the review findings
@@ -43,28 +56,72 @@ left unresolved on that PR on 2026-09-30:
    specs also replay the reviewer's reconnect cursor scenario, fixed upstream
    by `f9ddb12ab8`.
 
-The patch adds no database migration: the setting is bit 6 of the existing
+It adds no database migration: the setting is bit 6 of the existing
 `channel_web_widgets.feature_flags` column.
 
 ### The setting
 
-Off by default, so applying the patch changes nothing until an inbox opts
-in. To enable it for a website inbox: Settings, Inboxes, pick the inbox,
-Settings tab, "Widget features" section, then tick "Allow users to have
-multiple conversations from the widget" and save.
+Off by default. To enable it for a website inbox: Settings, Inboxes, pick
+the inbox, Settings tab, "Widget features" section, then tick "Allow users
+to have multiple conversations from the widget" and save.
 
 With the setting off, the widget behaves as in the release: one
 conversation, always the latest.
 
-### Applying it
+## Link interception for the host page (RAI-4261)
+
+### What it does
+
+It lets the page that embeds the widget handle clicks on links to its own
+origins, for example to navigate a single page app to the linked screen
+instead of opening it in a new tab:
+
+- the host page lists origins in `window.chatwootSettings.linkInterceptOrigins`
+  before the SDK runs;
+- the SDK keeps only `https:` origins (plus `http://localhost` on any port,
+  for development), each an origin and nothing more (no path, query string,
+  fragment or credentials), and forwards the list to the widget with the
+  `config-set` message;
+- in the widget, one delegated click handler watches links inside incoming
+  message content (agent and bot bubbles, `.chat-bubble.agent
+.message-content`, where `MessageFormatter` renders links with
+  `target=_blank`). A link whose origin is listed: the click is cancelled and
+  the widget posts `{ event: 'onLinkClick', url }` to the SDK. Pressing Enter
+  on a focused link dispatches the same click, so the keyboard behaves the
+  same;
+- the SDK checks the origin against the list again (any frame of the page
+  can post to it) and dispatches on the host window
+  `new CustomEvent('chatwoot:link-click', { detail: { url } })`.
+
+Any other link keeps the release behaviour (a new tab), and with no list set
+every link does. The host page stays responsible for validating the URL it
+receives before acting on it.
+
+```js
+window.chatwootSettings = {
+  linkInterceptOrigins: ['https://app.example.com'],
+};
+window.addEventListener('chatwoot:link-click', event => {
+  const url = new URL(event.detail.url);
+  // validate, then navigate
+});
+```
+
+Code: `app/javascript/shared/helpers/linkInterceptHelper.js` (origin
+validation, shared by both sides), `app/javascript/widget/helpers/linkInterceptHelper.js`
+(click handler, installed by `widget/App.vue`), `appConfig` store
+(`linkInterceptOrigins`), `sdk/IFrameHelper.js` (`onLinkClick`) and
+`entrypoints/sdk.js` (the setting). No backend change, no migration.
+
+## Applying it
 
 From a clean checkout of the release tag:
 
 ```sh
-git apply --3way rainpath/patches/widget-multi-conversations.patch
+git apply --3way rainpath/patches/rainpath.patch
 ```
 
-### Rebasing it on a new release
+## Rebasing it on a new release
 
 1. Branch from the new release commit, for example
    `git switch -c rainpath/vX.Y.Z vX.Y.Z`.
@@ -78,27 +135,40 @@ git apply --3way rainpath/patches/widget-multi-conversations.patch
 
    ```sh
    git diff --full-index vX.Y.Z HEAD -- . ':(exclude)rainpath' \
-     > rainpath/patches/widget-multi-conversations.patch
+     > rainpath/patches/rainpath.patch
    ```
 
 5. Check that it applies on a clean checkout of the release:
-   `git apply --check rainpath/patches/widget-multi-conversations.patch`.
+   `git apply --check rainpath/patches/rainpath.patch`.
 
-Checks run on v4.20.1, with Postgres (pgvector) and Redis running for rspec:
+Checks run on v4.20.1, with Postgres (pgvector) and Redis running for rspec
+(the link interception has JavaScript specs only, under `sdk/specs`,
+`shared/helpers/specs`, `widget/helpers/specs`, `widget/components/specs`
+and the `appConfig` store specs):
 
 ```sh
 pnpm test
 bundle exec rspec spec/controllers/api/v1/widget spec/builders/campaigns \
   spec/models/channel/web_widget_spec.rb spec/models/message_spec.rb \
   spec/controllers/api/v1/accounts/inboxes_controller_spec.rb
-pnpm exec eslint app/javascript/widget
+pnpm exec eslint app/javascript/widget app/javascript/sdk \
+  app/javascript/entrypoints/sdk.js app/javascript/shared/helpers
 bundle exec rubocop app/controllers/api/v1/widget app/builders/campaigns
 ```
 
-### When to drop it
+## When to drop it
+
+Each feature is dropped on its own; once both are gone, delete the patch.
+
+### Multiple conversations
 
 Watch [chatwoot/chatwoot#16002](https://github.com/chatwoot/chatwoot/pull/16002).
 Once it is merged and released, check that the release also covers the four
-fixes listed above (or that the code they touch has changed), then delete
-the patch and this section instead of rebasing it. If a fix is not
+fixes listed above (or that the code they touch has changed), then remove
+that part from the patch and its section here. If a fix is not
 upstream yet, keep only that part as a smaller patch.
+
+### Link interception
+
+Not proposed upstream yet. Drop it if upstream ships an equivalent host
+callback for message links, after switching the host page to it.

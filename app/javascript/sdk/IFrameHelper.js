@@ -24,6 +24,7 @@ import { isWidgetColorLighter } from 'shared/helpers/colorHelper';
 import { dispatchWindowEvent } from 'shared/helpers/CustomEventHelper';
 import {
   CHATWOOT_ERROR,
+  CHATWOOT_LINK_CLICK,
   CHATWOOT_POSTBACK,
   CHATWOOT_READY,
 } from '../widget/constants/sdkEvents';
@@ -35,6 +36,7 @@ import {
 } from 'shared/helpers/AudioNotificationHelper';
 import { isFlatWidgetStyle } from './settingsHelper';
 import { popoutChatWindow } from '../widget/helpers/popoutHelper';
+import { getInterceptedUrl } from 'shared/helpers/linkInterceptHelper';
 
 const updateAuthCookie = (cookieContent, baseDomain = '') =>
   setCookieWithDomain('cw_conversation', cookieContent, {
@@ -172,6 +174,7 @@ export const IFrameHelper = {
         enableFileUpload: window.$chatwoot.enableFileUpload,
         enableEmojiPicker: window.$chatwoot.enableEmojiPicker,
         enableEndConversation: window.$chatwoot.enableEndConversation,
+        linkInterceptOrigins: window.$chatwoot.linkInterceptOrigins,
       });
       IFrameHelper.onLoad({
         widgetColor: message.config.channelConfig.widgetColor,
@@ -218,6 +221,21 @@ export const IFrameHelper = {
       dispatchWindowEvent({
         eventName: CHATWOOT_POSTBACK,
         data,
+      });
+    },
+
+    // A link to one of the `linkInterceptOrigins` was clicked in the widget.
+    // The origin is checked again here: any frame of the page can post to it.
+    onLinkClick({ url }) {
+      const interceptedUrl = getInterceptedUrl(
+        url,
+        window.$chatwoot.linkInterceptOrigins
+      );
+      if (!interceptedUrl) return;
+
+      dispatchWindowEvent({
+        eventName: CHATWOOT_LINK_CLICK,
+        data: { url: interceptedUrl },
       });
     },
 

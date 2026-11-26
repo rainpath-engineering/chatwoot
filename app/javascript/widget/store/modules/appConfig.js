@@ -1,3 +1,4 @@
+import { sanitizeLinkInterceptOrigins } from 'shared/helpers/linkInterceptHelper';
 import {
   SET_BUBBLE_VISIBILITY,
   SET_COLOR_SCHEME,
@@ -28,6 +29,7 @@ const state = {
   enableFileUpload: undefined,
   enableEmojiPicker: true,
   enableEndConversation: true,
+  linkInterceptOrigins: [],
 };
 
 export const getters = {
@@ -48,6 +50,7 @@ export const getters = {
   getShouldShowFilePicker: $state => $state.enableFileUpload,
   getShouldShowEmojiPicker: $state => $state.enableEmojiPicker,
   getCanUserEndConversation: $state => $state.enableEndConversation,
+  getLinkInterceptOrigins: $state => $state.linkInterceptOrigins,
 };
 
 export const actions = {
@@ -67,6 +70,7 @@ export const actions = {
       enableFileUpload = undefined,
       enableEmojiPicker = true,
       enableEndConversation = true,
+      linkInterceptOrigins = [],
     }
   ) {
     commit(SET_WIDGET_APP_CONFIG, {
@@ -83,6 +87,7 @@ export const actions = {
       enableFileUpload,
       enableEmojiPicker,
       enableEndConversation,
+      linkInterceptOrigins: sanitizeLinkInterceptOrigins(linkInterceptOrigins),
     });
   },
   toggleWidgetOpen({ commit }, isWidgetOpen) {
@@ -125,6 +130,7 @@ export const mutations = {
     $state.enableFileUpload = data.enableFileUpload;
     $state.enableEmojiPicker = data.enableEmojiPicker;
     $state.enableEndConversation = data.enableEndConversation;
+    $state.linkInterceptOrigins = data.linkInterceptOrigins || [];
   },
   [TOGGLE_WIDGET_OPEN]($state, isWidgetOpen) {
     $state.isWidgetOpen = isWidgetOpen;
