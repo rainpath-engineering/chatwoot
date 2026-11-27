@@ -5,14 +5,15 @@ a single patch, `rainpath/patches/rainpath.patch`, so they can be re-applied
 on each new release and dropped once upstream ships the same thing.
 
 The patch is the full diff from the release commit to the fork branch
-(`rainpath/vX.Y.Z`), this folder excluded. It holds two features, described
-below. Both are off unless explicitly enabled, so applying the patch changes
-nothing for an inbox or a page that does not opt in.
+(`rainpath/vX.Y.Z`), this folder excluded. It holds two features and one wording change, described
+below. The two features are off unless explicitly enabled, so applying the patch changes
+nothing for an inbox or a page that does not opt in; the wording change is always on.
 
 | Feature                              | Linear   | Enabled by                                |
 | ------------------------------------ | -------- | ----------------------------------------- |
 | Multiple conversations in the widget | RAI-4201 | an inbox setting                          |
 | Link interception for the host page  | RAI-4261 | a `chatwootSettings` key on the host page |
+| French wording of the `open` activity | none yet | always on (French locale only)             |
 
 The file was named `widget-multi-conversations.patch` until it carried a
 second feature.
@@ -120,6 +121,29 @@ From a clean checkout of the release tag:
 ```sh
 git apply --3way rainpath/patches/rainpath.patch
 ```
+
+## French wording of the `open` activity
+
+### What it does
+
+Upstream words the activity line of ANY switch to `open` as "La conversation a
+été ré-ouverte par %{user_name}" (`conversations.activity.status.open` in
+`config/locales/fr.yml`). When an Agent Bot hands a `pending` conversation to the
+agents, which is what the RainPath support bot does after every answer or draft,
+Chatwoot posts that line, and the team reads it as a conversation that had been
+closed and was brought back, which it never was (reported by Alex Héritier,
+2026-11-27, on conversations 849 and 850 of production). The patch words it the
+way Chatwoot already words `captain.open`: "La conversation a été marquée ouverte
+par %{user_name}", true for a hand-off and for a real reopening alike.
+
+It is one string of the French locale. Unlike the two features above it has no
+switch: it applies to every French account of the instance.
+
+### When to drop it
+
+When upstream words that activity for a bot hand-off differently, or drops
+"ré-ouverte" from the French `status.open` string. Watch
+`config/locales/fr.yml` on each release.
 
 ## Rebasing it on a new release
 
