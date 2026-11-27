@@ -5356,6 +5356,19 @@ index 0000000000000000000000000000000000000000..50dfcf38d16bb8874a636f010fa2aaf1
 +  json.has_next_page !@conversations.last_page?
 +  json.unread_count @unread_conversation_count
 +end
+diff --git a/config/locales/fr.yml b/config/locales/fr.yml
+index 9d6c1252c845a69bb1afb7f50dfb5f664e44c7ae..c2d4cf9c8de8abe87362f16976ab9f0a3e7282e6 100644
+--- a/config/locales/fr.yml
++++ b/config/locales/fr.yml
+@@ -358,7 +358,7 @@ fr:
+       status:
+         resolved: 'La conversation a été marquée résolue par %{user_name}'
+         contact_resolved: 'La conversation a été résolue par %{contact_name}'
+-        open: 'La conversation a été ré-ouverte par %{user_name}'
++        open: 'La conversation a été marquée ouverte par %{user_name}'
+         pending: 'La conversation a été marquée comme en attente par %{user_name}'
+         snoozed: 'La conversation a été reportée par %{user_name}'
+         auto_resolved_days: 'La conversation a été marquée comme résolue par le système en raison de %{count} jours d''inactivité'
 diff --git a/config/routes.rb b/config/routes.rb
 index 9124088466d0e69d506ac5c38ec890c2922f14cc..9f6c4b968d2f28e30fd41beb921c6c3bbe978e3e 100644
 --- a/config/routes.rb
